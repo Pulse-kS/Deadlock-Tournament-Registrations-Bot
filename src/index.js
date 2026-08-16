@@ -1,0 +1,312 @@
+const fs = require('fs');
+const path = require('path');
+const { Client, GatewayIntentBits, Partials, Collection, MessageFlags, ChannelType } = require('discord.js');
+const config = require('./config');
+const registrationFlow = require('./flows/registrationFlow');
+const teams = require('./services/teams');
+const sessions = require('./utils/sessions');
+const sheets = require('./services/sheets');
+const localSnapshot = require('./services/localSnapshot');
+const instanceLock = require('./utils/instanceLock');
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    // Privileged intent, needs enabling in the Developer Portal (Bot tab ->
+    // Message Content Intent) same as Server Members Intent already does for
+    // GuildMembers above. Only needed so the bot can see attachments on
+    // other users' messages (team logo upload - see registrationFlow's
+    // handleMessage) - without it, message.attachments reads empty on
+    // anything not authored by the bot itself.
+    GatewayIntentBits.MessageContent,
+  ],
+  partials: [Partials.Channel],
+  // Nothing pings by default - team names, player names, and other free
+  // text a captain controls end up interpolated into message content
+  // (e.g. registrationFlow's pingStaff), and Discord parses @everyone/@here/
+  // <@&roleId>/<@userId> out of plain text same as if a person typed it. A
+  // team named "@everyone" would otherwise ping the whole server the next
+  // time the bot echoes it back. Call sites that need a real ping (the
+  // staff role, or the specific user who's mid-conversation with the bot)
+  // pass an explicit allowedMentions override with the exact ID(s) intended
+  // - never a `parse` category, which would let injected mention syntax
+  // ride along with the legitimate one.
+  allowedMentions: { parse: [] },
+});
+
+client.commands = new Collection();
+const commandsPath = path.join(__dirname, 'commands');
+for (const file of fs.readdirSync(commandsPath).filter((f) => f.endsWith('.js'))) {
+  const command = require(path.join(commandsPath, file));
+  client.commands.set(command.data.name, command);
+}
+
+/**
+ * Sweeps sessions.purgeStale() and archives/notifies any thread it turned
+ * up. Was previously only called once at startup (see clientReady below) -
+ * on a bot that stays up for days, an abandoned registration thread would
+ * sit open indefinitely instead of expiring after 48h as the message
+ * inside it claims. Now also run on a timer from main().
+ */
+async function purgeStaleSessions(context) {
+  const purged = sessions.purgeStale();
+  for (const threadId of purged) {
+    const thread = await client.channels.fetch(threadId).catch(() => null);
+    if (thread) {
+      await thread
+        .send('This registration session expired after 48h of inactivity. Run `/register` again to restart.')
+        .catch(() => {});
+      await thread.setArchived(true).catch(() => {});
+    }
+  }
+  if (purged.length > 0) {
+    console.log(`Purged ${purged.length} stale registration session(s) (${context}).`);
+  }
+}
+
+client.once('clientReady', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+
+  // reconcileTeamRole (teams.js) diffs against role.members, which is a
+  // filter over guild.members.cache - and that cache is NOT fully populated
+  // just because the GuildMembers intent is enabled. It only contains
+  // members discord.js has individually fetched or seen a gateway event for
+  // since this process started. Without this fetch, a player who registered
+  // a while ago and hasn't done anything else in the server since the bot's
+  // last restart simply isn't in cache - so removing them from a roster
+  // would silently fail to remove their Discord role, since toRemove never
+  // sees them as a current holder in the first place. This fetch forces a
+  // full cache warm-up once at startup; the GuildMembers intent then keeps
+  // it in sync live via gateway events for the rest of this process's life.
+  const guild = await client.guilds.fetch(config.discord.guildId).catch(() => null);
+  if (guild) {
+    const members = await guild.members.fetch().catch((err) => {
+      console.error('Failed to warm guild member cache on startup - role removal may miss members who are not yet cached:', err.message);
+      return null;
+    });
+    if (members) {
+      console.log(`Cached ${members.size} guild member(s) on startup.`);
+    }
+  } else {
+    console.error(`Could not fetch guild ${config.discord.guildId} on startup - role reconciliation may be unreliable until members are individually cached.`);
+  }
+
+  // Participant role is optional (see config.js) - if it's unset, or set to
+  // a role ID that doesn't exist in this guild, say so loudly once here
+  // rather than have every registration silently skip granting it with no
+  // signal at all (see teams.applyParticipantRole).
+  if (!config.discord.participantRoleId) {
+    console.log('No participant role set (PARTICIPANT_ROLE_ID) - new registrations will not get a participant role.');
+  } else if (guild) {
+    const participantRole = await guild.roles.fetch(config.discord.participantRoleId).catch(() => null);
+    if (!participantRole) {
+      console.error(
+        `PARTICIPANT_ROLE_ID (${config.discord.participantRoleId}) does not match any role in this guild - ` +
+          `new registrations will not get a participant role until this is fixed.`
+      );
+    }
+  }
+
+  // Team VC category is optional too (see config.js) - same "say so loudly
+  // once" treatment as participant role above, since a bad/missing category
+  // ID otherwise only surfaces as a silent skip on the first commit.
+  if (!config.discord.teamVcCategoryId) {
+    console.log('No team VC category set (TEAM_VC_CATEGORY_ID) - new teams will not get a private voice channel.');
+  } else if (guild) {
+    const category = await guild.channels.fetch(config.discord.teamVcCategoryId).catch(() => null);
+    if (!category) {
+      console.error(
+        `TEAM_VC_CATEGORY_ID (${config.discord.teamVcCategoryId}) does not match any channel in this guild - ` +
+          `new teams will not get a voice channel until this is fixed.`
+      );
+    } else if (category.type !== ChannelType.GuildCategory) {
+      console.error(`TEAM_VC_CATEGORY_ID (${config.discord.teamVcCategoryId}) is not a category channel - new teams will not get a voice channel until this is fixed.`);
+    }
+  }
+
+  // Admin role(s) are optional (see config.js) - same "say so loudly once"
+  // treatment as participant role/team VC category above. Unlike those,
+  // this can be a list, so each bad ID is checked and reported
+  // individually rather than failing the whole check on the first miss.
+  if (!config.discord.adminRoleIds.length) {
+    console.log('No admin role set (ADMIN_ROLE_ID) - only STAFF_ROLE_ID has elevated (but pinged) permissions.');
+  } else if (guild) {
+    for (const roleId of config.discord.adminRoleIds) {
+      const adminRole = await guild.roles.fetch(roleId).catch(() => null);
+      if (!adminRole) {
+        console.error(`ADMIN_ROLE_ID entry (${roleId}) does not match any role in this guild - it will not get admin permissions until this is fixed.`);
+      }
+    }
+  }
+
+  await purgeStaleSessions('on startup');
+
+  const retried = await registrationFlow.retryPendingWrites();
+  if (retried > 0) {
+    console.log(`Replayed ${retried} queued write(s) into the local store from before this restart.`);
+    // retryPendingWrites only gets them back into the local copy (see
+    // writeToSheets) - without this, they'd sit there until the next
+    // SHEETS_SYNC_INTERVAL_MINUTES tick (up to an hour) or a manual
+    // /refresh before actually reaching Google Sheets.
+    try {
+      const flushStartedAt = Date.now();
+      const result = await sheets.flush();
+      if (!result.skipped) registrationFlow.clearPendingWritesSyncedBefore(flushStartedAt);
+      console.log('Pushed replayed write(s) to Google Sheets.');
+    } catch (err) {
+      console.error(
+        `Failed to push replayed write(s) to Google Sheets - they're still queued in pending-writes.json and ` +
+          `will retry on the next sync or restart: ${err.message}`
+      );
+    }
+  }
+});
+
+client.on('interactionCreate', async (interaction) => {
+  try {
+    if (interaction.isChatInputCommand()) {
+      const command = client.commands.get(interaction.commandName);
+      if (!command) return;
+      await command.execute(interaction);
+      return;
+    }
+
+    if (interaction.isButton() || interaction.isStringSelectMenu()) {
+      await registrationFlow.handleComponent(interaction);
+      return;
+    }
+
+    if (interaction.isModalSubmit()) {
+      await registrationFlow.handleModalSubmit(interaction);
+      return;
+    }
+  } catch (err) {
+    console.error('Interaction handling error:', err);
+    const errorPayload = { content: 'Something went wrong handling that action. Staff have been notified.', flags: MessageFlags.Ephemeral };
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.followUp(errorPayload);
+      } else {
+        await interaction.reply(errorPayload);
+      }
+    } catch (_) {
+      // interaction may be past its ack window - nothing more we can do here.
+    }
+
+    if (config.discord.staffRoleIds.length && interaction.channel && interaction.channel.send) {
+      interaction.channel
+        .send({
+          content: `${config.discord.staffMention} Error in registration flow: \`${err.message}\``,
+          allowedMentions: { roles: config.discord.staffRoleIds },
+        })
+        .catch(() => {});
+    }
+  }
+});
+
+// Team logo uploads: captain sends an image as a plain message in their
+// registration thread (no modal support for file inputs) - see
+// registrationFlow.promptTeamLogo/handleMessage. No-ops on anything that
+// isn't a pending logo upload for that thread.
+client.on('messageCreate', async (message) => {
+  try {
+    await registrationFlow.handleMessage(message);
+  } catch (err) {
+    console.error('Failed handling message for team logo upload:', err);
+  }
+});
+
+// Grants a team role on join if PlayerRegistry shows this Discord ID currently rostered.
+client.on('guildMemberAdd', async (member) => {
+  try {
+    await teams.applyRoleOnJoin(member);
+  } catch (err) {
+    console.error('Failed to apply roster role for new member:', err);
+  }
+});
+
+async function main() {
+  // Must happen before sheets.init() - see instanceLock.js for why running
+  // two instances against the same spreadsheet is unsafe. Throws (and
+  // main().catch below exits) if another instance already holds it.
+  instanceLock.acquire();
+
+  console.log('Loading local copy of the spreadsheet from Google Sheets...');
+  await sheets.init();
+  console.log('Local Sheets copy loaded - reads/writes from here on are local, no Apps Script round trip.');
+
+  sheets.startBackgroundSync(config.sheets.syncIntervalMs, (flushStartedAt) => {
+    registrationFlow.clearPendingWritesSyncedBefore(flushStartedAt);
+  });
+  console.log(`Background sync to Google Sheets started (every ${config.sheets.syncIntervalMs / 60000} minute(s)).`);
+
+  let snapshotTimer = setInterval(() => {
+    localSnapshot.writeSnapshot().catch((err) => {
+      console.error(`[localSnapshot] Periodic snapshot failed: ${err.message}`);
+    });
+  }, config.sheets.snapshotIntervalMs);
+  if (typeof snapshotTimer.unref === 'function') snapshotTimer.unref();
+  console.log(
+    `Local crash-safety snapshot (${localSnapshot.SNAPSHOT_PATH}) started (every ${config.sheets.snapshotIntervalMs / 60000} minute(s), plus after every commit).`
+  );
+
+  let sessionPurgeTimer = setInterval(() => {
+    purgeStaleSessions('periodic sweep').catch((err) => {
+      console.error(`[sessions] Periodic stale-session sweep failed: ${err.message}`);
+    });
+  }, config.sessionPurgeIntervalMs);
+  if (typeof sessionPurgeTimer.unref === 'function') sessionPurgeTimer.unref();
+  console.log(`Stale registration session sweep started (every ${config.sessionPurgeIntervalMs / 60000} minute(s)).`);
+
+  await client.login(config.discord.token);
+}
+
+main().catch((err) => {
+  console.error('Fatal startup error:', err);
+  instanceLock.release(); // no-op if acquire() never got far enough to write it
+  process.exit(1);
+});
+
+let shuttingDown = false;
+async function shutdown(signal, exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(`Received ${signal} - flushing local Sheets changes to Google before exit...`);
+  try {
+    const flushStartedAt = Date.now();
+    const result = await sheets.flush();
+    if (!result.skipped) registrationFlow.clearPendingWritesSyncedBefore(flushStartedAt);
+    console.log('Flush complete - Google Sheets is up to date.');
+  } catch (err) {
+    console.error(
+      `Flush on shutdown failed - any local changes since the last successful background sync were NOT saved ` +
+        `to Google Sheets: ${err.message}`
+    );
+  }
+
+  sheets.stopBackgroundSync();
+  instanceLock.release();
+  client.destroy();
+  process.exit(exitCode);
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// Without these, a bug that throws outside any try/catch (or a rejected
+// promise nobody awaited/caught) skips shutdown() entirely - no flush, so
+// anything written to the local store since the last background sync is
+// lost, on top of whatever the bug itself broke. Exit code 1 (rather than
+// shutdown()'s normal 0) so start-bot.bat's crash-loop counter still counts
+// this as the crash it is.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason);
+  shutdown('unhandledRejection', 1);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+  shutdown('uncaughtException', 1);
+});

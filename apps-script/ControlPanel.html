@@ -1,0 +1,297 @@
+<!--
+  Tournament Admin control panel - sidebar shown via a custom Sheets menu.
+  Lets a TO run the three end-of-signups actions from inside the Sheet
+  itself, no Discord/terminal involved.
+
+  WIRING THIS UP:
+  1. Save this file into the Apps Script project as an HTML file named
+     "ControlPanel" (File > New > HTML in the script editor).
+  2. The onOpen(e) menu trigger and all five backend functions this panel
+     calls are already implemented in this repo's apps-script/Code.gs (see
+     that file's top comment, step 4, and its "Tournament Admin sidebar"
+     section) - paste Code.gs in alongside this file and reload the
+     spreadsheet; nothing else to wire up.
+
+  The five backend functions (documented here for reference - see Code.gs
+  for the actual implementations):
+
+       getRosterDefaults()
+         -> returns { includeSeeding } to prefill the checkbox below.
+
+       previewRosterTemplate({ includeSeeding })
+         -> parses the Control Sheet's Template tab and writes a
+            placeholder-data dry run to its Rosters tab, so layout
+            mistakes are visible before real data is written. Returns a
+            summary string on success, throws with a human-readable
+            message on failure (e.g. a template validation error).
+
+       sendRostersToControlSheet({ includeSeeding })
+         -> same template + layout inference as the preview above, but
+            writes real roster data. Returns a summary string on success,
+            throws on failure.
+
+       updateDatabase()
+         -> wraps migrateFinishedEvent() (the TeamDB/PlayerDB migration).
+            Returns a summary string, or throws on failure.
+
+       clearCurrentSignups()
+         -> clears Teams' current signup rows (NOT PlayerRegistry - that
+            table is persistent player identity, not per-event data; see
+            its doc comment in Code.gs). Returns a summary string, or
+            throws on failure. Destructive - the panel already
+            double-confirms client-side before calling it.
+
+     Any of the five can throw a plain Error(message) - the message shows
+     up verbatim in the panel's status area.
+
+  STYLING NOTE: matched to the Tournament Management Bot's sidebar
+  (flat sections, no boxed/bordered cards, collapsible grey "Settings"
+  toggles) so both bots' panels look like one product - see that repo's
+  own sidebar HTML for the same pattern.
+-->
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body {
+      font-family: 'Google Sans', Roboto, Arial, sans-serif;
+      font-size: 13px;
+      color: #202124;
+      margin: 0;
+      padding: 16px;
+    }
+    h1 {
+      font-size: 15px;
+      font-weight: 600;
+      margin: 0 0 4px;
+    }
+    .subtitle {
+      color: #5f6368;
+      margin: 0 0 20px;
+      font-size: 12px;
+    }
+    .section {
+      margin-bottom: 20px;
+    }
+    .section h2 {
+      font-size: 13px;
+      font-weight: 600;
+      margin: 0 0 6px;
+    }
+    .section p.desc {
+      color: #5f6368;
+      font-size: 12px;
+      margin: 0 0 12px;
+      line-height: 1.45;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #dadce0;
+      margin: 20px 0;
+    }
+    button {
+      display: block;
+      width: 100%;
+      box-sizing: border-box;
+      padding: 9px 10px;
+      border: none;
+      border-radius: 4px;
+      font-size: 12.5px;
+      font-weight: 500;
+      cursor: pointer;
+      background: #1a73e8;
+      color: #fff;
+      margin-bottom: 8px;
+    }
+    button:last-child { margin-bottom: 0; }
+    button:hover:not(:disabled) {
+      background: #1765cc;
+    }
+    button.danger {
+      background: #d93025;
+    }
+    button.danger:hover:not(:disabled) {
+      background: #c5221f;
+    }
+    button:disabled {
+      background: #dadce0;
+      color: #80868b;
+      cursor: default;
+    }
+    /* Grey collapsible "Settings" toggle, matched to the Tournament
+       Management Bot sidebar's "▼ Bot Settings" / "▼ Spreadsheet
+       Settings" buttons. */
+    button.settings-toggle {
+      background: #5f6368;
+      text-align: left;
+      position: relative;
+      padding-left: 28px;
+    }
+    button.settings-toggle:hover:not(:disabled) {
+      background: #4a4d51;
+    }
+    button.settings-toggle::before {
+      content: '\25BC';
+      position: absolute;
+      left: 10px;
+      font-size: 9px;
+      transition: transform 0.15s ease;
+    }
+    button.settings-toggle.open::before {
+      transform: rotate(180deg);
+    }
+    .settings-panel {
+      display: none;
+      padding: 10px 2px 2px;
+    }
+    .settings-panel.open {
+      display: block;
+    }
+    .settings-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+      font-size: 12.5px;
+    }
+    .settings-row input[type="text"] {
+      width: 48px;
+      padding: 3px 6px;
+      border: 1px solid #dadce0;
+      border-radius: 4px;
+    }
+    .settings-row label {
+      cursor: pointer;
+    }
+    .status {
+      margin-top: 8px;
+      font-size: 11.5px;
+      line-height: 1.4;
+      min-height: 14px;
+      white-space: pre-wrap;
+    }
+    .status.working { color: #5f6368; }
+    .status.success { color: #188038; }
+    .status.error { color: #d93025; }
+  </style>
+</head>
+<body>
+  <h1>Tournament Admin</h1>
+  <p class="subtitle">Run these once signups are closed for this event.</p>
+
+  <div class="section">
+    <h2>1. Roster cards</h2>
+    <p class="desc">Tiles your Control Sheet's Template tab roster card once per team, laid out however its {{#N}} example blocks are arranged.</p>
+    <button type="button" class="settings-toggle" id="btnToggleRosterSettings">Roster Settings</button>
+    <div class="settings-panel" id="rosterSettingsPanel">
+      <div class="settings-row">
+        <input type="checkbox" id="includeSeeding">
+        <label for="includeSeeding">Include seeding</label>
+      </div>
+      <button id="btnPreview">Preview Layout</button>
+    </div>
+    <button id="btnSend">Send Rosters</button>
+    <div class="status" id="statusSend"></div>
+  </div>
+
+  <hr>
+
+  <div class="section">
+    <h2>2. Update database</h2>
+    <p class="desc">Migrates this event's teams and player registry into TeamDB/PlayerDB.</p>
+    <button id="btnUpdate">Update Database</button>
+    <div class="status" id="statusUpdate"></div>
+  </div>
+
+  <hr>
+
+  <div class="section">
+    <h2>3. Clear current signups</h2>
+    <p class="desc">Wipes this event's signup rows so the sheet is ready for the next one. Do this last.</p>
+    <button id="btnClear" class="danger">Clear Signups</button>
+    <div class="status" id="statusClear"></div>
+  </div>
+
+  <script>
+    // Fallback default if getRosterDefaults() isn't implemented yet, or fails.
+    const DEFAULTS = { includeSeeding: true };
+
+    function setStatus(el, kind, message) {
+      el.className = 'status ' + kind;
+      el.textContent = message;
+    }
+
+    function withButton(button, statusEl, workingMessage, run) {
+      button.disabled = true;
+      setStatus(statusEl, 'working', workingMessage);
+      run(
+        (result) => {
+          button.disabled = false;
+          setStatus(statusEl, 'success', result || 'Done.');
+        },
+        (error) => {
+          button.disabled = false;
+          setStatus(statusEl, 'error', 'Failed: ' + (error && error.message ? error.message : error));
+        }
+      );
+    }
+
+    // --- Collapsible settings toggle ---
+    const toggleBtn = document.getElementById('btnToggleRosterSettings');
+    const settingsPanel = document.getElementById('rosterSettingsPanel');
+    toggleBtn.addEventListener('click', () => {
+      toggleBtn.classList.toggle('open');
+      settingsPanel.classList.toggle('open');
+    });
+
+    // --- Prefill settings from Code.gs, falling back to DEFAULTS on any failure. ---
+    function applyDefaults(defaults) {
+      document.getElementById('includeSeeding').checked = !!defaults.includeSeeding;
+    }
+    applyDefaults(DEFAULTS);
+    if (typeof google !== 'undefined' && google.script && google.script.run) {
+      google.script.run
+        .withSuccessHandler((defaults) => applyDefaults(defaults || DEFAULTS))
+        .withFailureHandler(() => applyDefaults(DEFAULTS))
+        .getRosterDefaults();
+    }
+
+    // --- 1. Roster cards (preview, then send) ---
+    document.getElementById('btnPreview').addEventListener('click', () => {
+      const statusEl = document.getElementById('statusSend');
+      const settings = { includeSeeding: document.getElementById('includeSeeding').checked };
+      withButton(document.getElementById('btnPreview'), statusEl, 'Building preview...', (onSuccess, onFailure) => {
+        google.script.run.withSuccessHandler(onSuccess).withFailureHandler(onFailure).previewRosterTemplate(settings);
+      });
+    });
+
+    document.getElementById('btnSend').addEventListener('click', () => {
+      const statusEl = document.getElementById('statusSend');
+      const settings = { includeSeeding: document.getElementById('includeSeeding').checked };
+      withButton(document.getElementById('btnSend'), statusEl, 'Sending rosters...', (onSuccess, onFailure) => {
+        google.script.run.withSuccessHandler(onSuccess).withFailureHandler(onFailure).sendRostersToControlSheet(settings);
+      });
+    });
+
+    // --- 2. Update database ---
+    document.getElementById('btnUpdate').addEventListener('click', () => {
+      if (!window.confirm('Migrate this event\'s teams and player registry into TeamDB/PlayerDB?')) return;
+      const statusEl = document.getElementById('statusUpdate');
+      withButton(document.getElementById('btnUpdate'), statusEl, 'Updating database...', (onSuccess, onFailure) => {
+        google.script.run.withSuccessHandler(onSuccess).withFailureHandler(onFailure).updateDatabase();
+      });
+    });
+
+    // --- 3. Clear current signups (destructive - double confirm) ---
+    document.getElementById('btnClear').addEventListener('click', () => {
+      if (!window.confirm('This clears all current signup rows. Rosters should be sent and the database updated first - continue?')) return;
+      if (!window.confirm('Are you sure? This cannot be undone from the sidebar.')) return;
+      const statusEl = document.getElementById('statusClear');
+      withButton(document.getElementById('btnClear'), statusEl, 'Clearing signups...', (onSuccess, onFailure) => {
+        google.script.run.withSuccessHandler(onSuccess).withFailureHandler(onFailure).clearCurrentSignups();
+      });
+    });
+  </script>
+</body>
+</html>
