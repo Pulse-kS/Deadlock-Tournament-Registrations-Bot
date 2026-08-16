@@ -61,7 +61,7 @@ need to do steps 3-5 below (Discord permissions, Apps Script setup,
 
 </details>
 
-3. In the Discord Developer Portal, make sure the bot has the **Manage Roles** permission, and that its own role sits above any team roles it'll create (Discord won't let a bot assign/manage roles positioned above its own). Also enable the **Message Content Intent** (Bot tab, privileged intents section - same place as Server Members Intent) - needed for team logo uploads to work. `npm run deploy-commands` (registers `/register`, `/refresh`, and `/config` to your guild - re-run only when command definitions change)
+3. In the Discord Developer Portal, make sure the bot has the **Manage Roles** permission, and that its own role sits above any team roles it'll create (Discord won't let a bot assign/manage roles positioned above its own). Also enable the **Message Content Intent** (Bot tab, privileged intents section - same place as Server Members Intent) - needed for team logo uploads to work. `npm run deploy-commands` (registers `/register`, `/refresh`, `/config`, and `/update` to your guild - re-run only when command definitions change)
 
    **Also applies as of this version**: the `/config` command is new -
    re-run `npm run deploy-commands` after updating, or Discord won't show
@@ -112,6 +112,24 @@ One-off maintenance scripts (`npm run post-event`, `npm run recover-ids`)
 work the same way -
 `docker compose run --rm registration-bot npm run <script>` - since they're
 copied into the image alongside `src/`.
+
+#### `/update` (Docker + git installs only)
+
+An admin can run `/update` in Discord instead of doing any of the above by
+hand. The bot can't rebuild/restart its own container from the inside (it
+would kill itself mid-command), so `/update` just drops a request file in
+`./data` - a separate script on the host, **`scripts/git-update-watcher.sh`**,
+has to be scheduled outside Docker (cron, Unraid's User Scripts plugin,
+etc.) to actually notice it, `git pull`, rebuild, and restart. Read the
+comments at the top of that script before wiring it up - it assumes the
+install directory is a `git clone` of this repo (via a read-only [deploy
+key](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys)),
+not something `update.sh`/a zip drop manages. Once restarted, the bot posts
+a confirmation back in the channel `/update` was run from.
+
+`ADMIN_ROLE_ID` must be set for `/update` to be usable at all - it's
+deliberately gated on admin, not staff (see `commands/config.js`'s comment
+on why those are kept separate).
 
 ### Google Apps Script setup
 

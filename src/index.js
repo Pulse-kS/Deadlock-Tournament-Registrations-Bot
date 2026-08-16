@@ -8,6 +8,36 @@ const sessions = require('./utils/sessions');
 const sheets = require('./services/sheets');
 const localSnapshot = require('./services/localSnapshot');
 const instanceLock = require('./utils/instanceLock');
+const { dataDir } = require('./utils/dataDir');
+const pkg = require('../package.json');
+
+const UPDATE_ACK_PATH = path.join(dataDir(), 'update-ack.json');
+
+/**
+ * Companion to commands/update.js: after the host's watcher script pulls,
+ * rebuilds, and restarts the bot, it leaves an ack file behind (channel +
+ * before/after version) instead of the now-dead old process trying to
+ * report success itself. The new process picks it up here on its first
+ * boot and posts the result back to whoever ran /update, then removes the
+ * file so it doesn't get reposted on the next restart.
+ */
+async function announceUpdateIfPending() {
+  let ack;
+  try {
+    ack = JSON.parse(fs.readFileSync(UPDATE_ACK_PATH, 'utf8'));
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.error('[update] Could not read update-ack.json:', err.message);
+    return;
+  }
+  // Remove first - if channel.send below fails, we'd rather silently miss
+  // the notification than get stuck reposting it on every future restart.
+  fs.unlink(UPDATE_ACK_PATH, () => {});
+  const channel = await client.channels.fetch(ack.channelId).catch(() => null);
+  if (!channel || !channel.send) return;
+  await channel
+    .send(`✅ Update complete - now running \`${pkg.version}\` (was \`${ack.fromVersion || 'unknown'}\`).`)
+    .catch((err) => console.error('[update] Could not post update-complete message:', err.message));
+}
 
 const client = new Client({
   intents: [
@@ -142,6 +172,7 @@ client.once('clientReady', async () => {
   }
 
   await purgeStaleSessions('on startup');
+  await announceUpdateIfPending();
 
   const retried = await registrationFlow.retryPendingWrites();
   if (retried > 0) {
