@@ -9,7 +9,7 @@ roles + a Google Sheet backend automatically.
 running bot. This document covers the same ground in more depth, plus
 Docker, remote updates, and everything else.
 
-## Status: 20260815-09
+## Status: 20260817-03
 
 Core registration flow (new team, edit existing team, keep/rename/discard
 per slot, Steam ID resolution, statlocker lookup, nationality capture, role
@@ -118,14 +118,29 @@ copied into the image alongside `src/`.
 An admin can run `/update` in Discord instead of doing any of the above by
 hand. The bot can't rebuild/restart its own container from the inside (it
 would kill itself mid-command), so `/update` just drops a request file in
-`./data` - a separate script on the host, **`scripts/git-update-watcher.sh`**,
-has to be scheduled outside Docker (cron, Unraid's User Scripts plugin,
-etc.) to actually notice it, `git pull`, rebuild, and restart. Read the
-comments at the top of that script before wiring it up - it assumes the
+`./data` - a separate script on the host has to be scheduled outside Docker
+(cron, Unraid's User Scripts plugin, etc.) to actually notice it, check for
+new commits, and (only if there are any) `git pull`, rebuild, and restart.
+
+**That watcher script is intentionally not part of this repo.** It's the
+one piece with real host access (git + Docker), so it's maintained
+directly on the host, outside the update path it controls - a repo
+compromise (or a compromised bot process) then can't rewrite the very
+script that would execute its changes with host privileges on the next
+update. If you're setting this up fresh, you'll need to write your own
+watcher script (or ask whoever hosts this bot for theirs) - it assumes the
 install directory is a `git clone` of this repo (via a read-only [deploy
 key](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys)),
-not something `update.sh`/a zip drop manages. Once restarted, the bot posts
-a confirmation back in the channel `/update` was run from.
+not something `update.sh`/a zip drop manages.
+
+The watcher should check the actual git commit hash against GitHub before
+doing anything else - if they already match, skip the rebuild/restart
+entirely rather than causing a pointless outage to redeploy identical code,
+and the bot posts an "already up to date" message instead. The commit hash
+(not the `package.json` version number) is what's shown as proof either
+way, since the version number is a human-typed label that's easy to forget
+to bump - the hash is generated automatically for every commit and can't go
+stale.
 
 `ADMIN_ROLE_ID` must be set for `/update` to be usable at all - it's
 deliberately gated on admin, not staff (see `commands/config.js`'s comment

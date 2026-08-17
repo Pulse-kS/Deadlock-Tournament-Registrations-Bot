@@ -36,6 +36,16 @@ let dirty = false;
 let syncTimer = null;
 let initialized = false;
 
+// Tracks consecutive background-sync failures (reset to 0 on any successful
+// sync). A single failed sync is routine - Apps Script cold starts/transient
+// timeouts happen and the next hourly attempt almost always recovers - so it
+// logs at 'warn'. Only once failures stack up across multiple consecutive
+// cycles (SYNC_FAILURE_ALERT_THRESHOLD) does it escalate to 'error', since
+// that's the point where it stops being noise and starts meaning the live
+// Google Sheet has been silently stale for hours and is worth a human check.
+let consecutiveSyncFailures = 0;
+const SYNC_FAILURE_ALERT_THRESHOLD = 3; // ~3 hours at the default 60-min interval
+
 // PlayerDB/TeamDB are staff-maintained, bot-never-writes tabs (see
 // services/playerDB.js and services/teamDB.js). They still get pulled into
 // `store` at init() like every other tab so getTable() works uniformly, but
@@ -169,8 +179,17 @@ function startBackgroundSync(intervalMs, onFlushSuccess) {
         if (!result.skipped && typeof onFlushSuccess === 'function') onFlushSuccess(flushStartedAt);
         return refreshAllTables();
       })
+      .then(() => {
+        consecutiveSyncFailures = 0;
+      })
       .catch((err) => {
-        console.error(`[sheets] Background sync to Google Sheets failed (will retry next interval): ${err.message}`);
+        consecutiveSyncFailures += 1;
+        const message = `[sheets] Background sync to Google Sheets failed (will retry next interval): ${err.message}`;
+        if (consecutiveSyncFailures >= SYNC_FAILURE_ALERT_THRESHOLD) {
+          console.error(`${message} - this is sync failure #${consecutiveSyncFailures} in a row; the live Google Sheet may be stale, worth checking.`);
+        } else {
+          console.warn(message);
+        }
       });
   }, intervalMs);
   // Don't let this timer alone keep the process alive (e.g. during a clean shutdown).
