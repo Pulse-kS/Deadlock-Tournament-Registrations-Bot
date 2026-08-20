@@ -295,6 +295,10 @@ async function main() {
   const [participantRole] = await pickFromList(rl, roleOptions, { prompt: 'Role number', emptyLabel: 'roles' });
 
   console.log('');
+  console.log('Free agent role - optional. Granted to players who sign up as a free agent instead of a team. Press Enter to skip.');
+  const [freeAgentRole] = await pickFromList(rl, roleOptions, { prompt: 'Role number', emptyLabel: 'roles' });
+
+  console.log('');
   console.log("Team voice channel category - optional. Where each team's private VC gets created. Press Enter to skip.");
   const [teamVcCategory] = await pickFromList(rl, categories, { prompt: 'Category number', emptyLabel: 'categories' });
 
@@ -365,6 +369,7 @@ async function main() {
     `STAFF_ROLE_ID=${staffRoles.map((r) => r.id).join(',')}`,
     adminRoles.length ? `ADMIN_ROLE_ID=${adminRoles.map((r) => r.id).join(',')}` : '# ADMIN_ROLE_ID=',
     participantRole ? `PARTICIPANT_ROLE_ID=${participantRole.id}` : '# PARTICIPANT_ROLE_ID=',
+    freeAgentRole ? `FREE_AGENT_ROLE_ID=${freeAgentRole.id}` : '# FREE_AGENT_ROLE_ID=',
     teamVcCategory ? `TEAM_VC_CATEGORY_ID=${teamVcCategory.id}` : '# TEAM_VC_CATEGORY_ID=',
     teamVcWelcomeMessage ? `TEAM_VC_WELCOME_MESSAGE=${teamVcWelcomeMessage}` : '# TEAM_VC_WELCOME_MESSAGE=',
     '',

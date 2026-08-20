@@ -6,8 +6,9 @@
  *
  *   1. Calls the Apps Script web app's "migrateFinishedEvent" action,
  *      which runs migrateTeamsToTeamDB() + migratePlayerRegistryToPlayerDB()
- *      server-side (see Code.gs) - copies Teams -> TeamDB and
- *      PlayerRegistry -> PlayerDB directly in the live sheet.
+ *      + migrateFreeAgentsToPlayerDB() server-side (see Code.gs) - copies
+ *      Teams -> TeamDB and both PlayerRegistry -> PlayerDB and
+ *      FreeAgents -> PlayerDB directly in the live sheet.
  *   2. Archives audit.log locally (renamed, not deleted) so a new one
  *      starts clean for the next event.
  *
@@ -63,11 +64,11 @@ function defaultLabel() {
 }
 
 async function runMigration() {
-  console.log('Calling Apps Script to migrate Teams -> TeamDB and PlayerRegistry -> PlayerDB...');
+  console.log('Calling Apps Script to migrate Teams -> TeamDB and PlayerRegistry/FreeAgents -> PlayerDB...');
   const result = await callAppsScript(config.sheets.webAppUrl, config.sheets.sharedSecret, 'migrateFinishedEvent', {}, '[post-event]');
   console.log(
     `  Teams -> TeamDB: updated ${result.teams.updated}, appended ${result.teams.appended}.\n` +
-      `  PlayerRegistry -> PlayerDB: updated ${result.players.updated}, appended ${result.players.appended}` +
+      `  PlayerRegistry + FreeAgents -> PlayerDB: updated ${result.players.updated}, appended ${result.players.appended}` +
       (result.players.skippedBlank ? `, skipped ${result.players.skippedBlank} row(s) with no account_id` : '') +
       '.'
   );

@@ -131,6 +131,12 @@ const SCHEMA = {
   // versions of Teams' own columns of the same name - see this file's top
   // comment for how that copy happens.
   TeamDB: ['team_role_id', 'team_name', 'logo_url', 'vc_channel_id', 'p1', 'p2', 'p3', 'p4', 'p5', 'p6', 's1', 's2', 'c1', 'c2'],
+  // One row per player who signed up as a free agent (no team, no roster
+  // slot) via /register's "I am a Free Agent" path - see
+  // registrationFlow.js's finalizeFreeAgent/writeFreeAgentToSheets.
+  // `wants_team` is "Yes"/"No" - whether the player asked to be assigned a
+  // team, versus only being available as an emergency substitute.
+  FreeAgents: ['account_id', 'discord_id', 'display_name', 'nationality', 'statlocker_username', 'wants_team'],
 };
 
 // How many data rows to pre-format as Plain Text on the *_id columns.
@@ -502,43 +508,40 @@ function migrateTeamsToTeamDB() {
 }
 
 /**
- * Copies every `PlayerRegistry` row into `PlayerDB`, matched by
- * `account_id` (see "Migrating a finished event" in the README). Unlike
- * migrateTeamsToTeamDB, the two tabs don't share a column layout - `best_name`
- * is sourced from `display_name` (falling back to `statlocker_username` if
- * a player never set one), and every other name PlayerRegistry has on file
- * for that player (`statlocker_username`, `historical_names`, and - on an
- * update - `PlayerDB`'s own prior `best_name` if it's about to change) is
- * folded into `past_igns` rather than discarded, so repeat migrations build
- * up a name history instead of overwriting it. `past_discord_names` works
- * the same way: only touched when a player's `discord_id` is actually
- * changing, and the old ID is archived there rather than dropped. Existing
- * `PlayerDB` columns this function doesn't know about (e.g. a `score`
- * column left over from past manual upkeep) are left untouched.
+ * Shared core for migratePlayerRegistryToPlayerDB and
+ * migrateFreeAgentsToPlayerDB below - both copy player-identity data into
+ * `PlayerDB`, matched by `account_id`, with identical merge semantics
+ * (archive every other name into `past_igns`, archive a changing
+ * `discord_id` into `past_discord_names`, never touch a `PlayerDB` column
+ * this function doesn't know about). sourceSheetName/requiredCols feed
+ * assertHasColumns_ against that source tab; extractRow(row, idx) must
+ * return { accountId, discordId, nationality, bestName, otherNames } for
+ * one source row (otherNames already excludes bestName), or a falsy
+ * accountId to skip that row (counted as skippedBlank).
  *
- * Purely additive to `PlayerDB` - never touches `PlayerRegistry` itself, so
- * it's safe to re-run. Same "run with the bot stopped" rule as
+ * Purely additive to `PlayerDB` - never touches the source tab, so it's
+ * safe to re-run. Same "run with the bot stopped" rule as
  * migrateTeamsToTeamDB above.
  */
-function migratePlayerRegistryToPlayerDB() {
+function migrateToPlayerDB_(sourceSheetName, requiredCols, extractRow) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const registrySheet = ss.getSheetByName('PlayerRegistry');
+  const sourceSheet = ss.getSheetByName(sourceSheetName);
   const dbSheet = ss.getSheetByName('PlayerDB');
-  if (!registrySheet || !dbSheet) throw new Error('PlayerRegistry and/or PlayerDB tab not found.');
+  if (!sourceSheet || !dbSheet) throw new Error(`${sourceSheetName} and/or PlayerDB tab not found.`);
 
-  const registryHeaders = registrySheet.getRange(1, 1, 1, registrySheet.getLastColumn()).getValues()[0];
+  const sourceHeaders = sourceSheet.getRange(1, 1, 1, sourceSheet.getLastColumn()).getValues()[0];
   const dbHeaders = dbSheet.getRange(1, 1, 1, dbSheet.getLastColumn()).getValues()[0];
-  const regIdx = headerIndexMap_(registryHeaders);
+  const srcIdx = headerIndexMap_(sourceHeaders);
   const dbIdx = headerIndexMap_(dbHeaders);
-  assertHasColumns_('PlayerRegistry', regIdx, ['account_id', 'statlocker_username', 'discord_id', 'historical_names', 'nationality', 'display_name']);
+  assertHasColumns_(sourceSheetName, srcIdx, requiredCols);
   assertHasColumns_('PlayerDB', dbIdx, ['account_id', 'discord_id', 'nationality', 'best_name', 'past_igns', 'past_discord_names']);
 
-  const registryLastRow = registrySheet.getLastRow();
-  if (registryLastRow < 2) {
-    Logger.log('PlayerRegistry has no data rows - nothing to migrate.');
-    return;
+  const sourceLastRow = sourceSheet.getLastRow();
+  if (sourceLastRow < 2) {
+    Logger.log(`${sourceSheetName} has no data rows - nothing to migrate.`);
+    return { updated: 0, appended: 0, skippedBlank: 0 };
   }
-  const registryValues = registrySheet.getRange(2, 1, registryLastRow - 1, registryHeaders.length).getDisplayValues();
+  const sourceValues = sourceSheet.getRange(2, 1, sourceLastRow - 1, sourceHeaders.length).getDisplayValues();
 
   const dbLastRow = dbSheet.getLastRow();
   const dbValues = dbLastRow >= 2 ? dbSheet.getRange(2, 1, dbLastRow - 1, dbHeaders.length).getDisplayValues() : [];
@@ -554,21 +557,13 @@ function migratePlayerRegistryToPlayerDB() {
   let skippedBlank = 0;
   const toAppend = [];
 
-  registryValues.forEach((row) => {
-    const accountId = (row[regIdx.account_id] || '').trim();
-    if (!accountId) {
+  sourceValues.forEach((row) => {
+    const extracted = extractRow(row, srcIdx);
+    if (!extracted || !extracted.accountId) {
       skippedBlank++;
       return;
     }
-    const discordId = (row[regIdx.discord_id] || '').trim();
-    const nationality = (row[regIdx.nationality] || '').trim();
-    const statlockerUsername = (row[regIdx.statlocker_username] || '').trim();
-    const historicalNames = (row[regIdx.historical_names] || '').trim();
-    const bestName = (row[regIdx.display_name] || '').trim() || statlockerUsername;
-    // Every other name PlayerRegistry has on file, besides the one we're
-    // about to write as best_name - archived into past_igns below.
-    const otherNames = [statlockerUsername, historicalNames].filter((n) => n && n !== bestName);
-
+    const { accountId, discordId, nationality, bestName, otherNames } = extracted;
     const existingIdx = dbRowIndexByAccountId.get(accountId);
 
     if (existingIdx === undefined) {
@@ -609,11 +604,70 @@ function migratePlayerRegistryToPlayerDB() {
   }
 
   Logger.log(
-    `PlayerRegistry -> PlayerDB migration complete. Updated ${updated} existing row(s), appended ${appended} new row(s)` +
+    `${sourceSheetName} -> PlayerDB migration complete. Updated ${updated} existing row(s), appended ${appended} new row(s)` +
       (skippedBlank ? `, skipped ${skippedBlank} row(s) with no account_id` : '') +
       '.'
   );
   return { updated, appended, skippedBlank };
+}
+
+/**
+ * Copies every `PlayerRegistry` row into `PlayerDB`, matched by
+ * `account_id` (see "Migrating a finished event" in the README). `best_name`
+ * is sourced from `display_name` (falling back to `statlocker_username` if
+ * a player never set one); every other name PlayerRegistry has on file for
+ * that player (`statlocker_username`, `historical_names`) is folded into
+ * `past_igns` rather than discarded - see migrateToPlayerDB_ above for the
+ * shared merge logic both this and migrateFreeAgentsToPlayerDB use.
+ */
+function migratePlayerRegistryToPlayerDB() {
+  return migrateToPlayerDB_(
+    'PlayerRegistry',
+    ['account_id', 'statlocker_username', 'discord_id', 'historical_names', 'nationality', 'display_name'],
+    (row, idx) => {
+      const accountId = (row[idx.account_id] || '').trim();
+      if (!accountId) return null;
+      const statlockerUsername = (row[idx.statlocker_username] || '').trim();
+      const historicalNames = (row[idx.historical_names] || '').trim();
+      const bestName = (row[idx.display_name] || '').trim() || statlockerUsername;
+      return {
+        accountId,
+        discordId: (row[idx.discord_id] || '').trim(),
+        nationality: (row[idx.nationality] || '').trim(),
+        bestName,
+        otherNames: [statlockerUsername, historicalNames].filter((n) => n && n !== bestName),
+      };
+    }
+  );
+}
+
+/**
+ * Copies every `FreeAgents` row into `PlayerDB`, matched by `account_id` -
+ * same shared merge logic as migratePlayerRegistryToPlayerDB above (see
+ * migrateToPlayerDB_), just sourced from a free agent's own
+ * `display_name`/`statlocker_username` instead of `PlayerRegistry`'s.
+ * Purely additive to `PlayerDB` - never touches `FreeAgents` itself.
+ * `wants_team` isn't carried over - `PlayerDB` is pure identity, not
+ * per-event signup intent.
+ */
+function migrateFreeAgentsToPlayerDB() {
+  return migrateToPlayerDB_(
+    'FreeAgents',
+    ['account_id', 'discord_id', 'display_name', 'nationality', 'statlocker_username'],
+    (row, idx) => {
+      const accountId = (row[idx.account_id] || '').trim();
+      if (!accountId) return null;
+      const statlockerUsername = (row[idx.statlocker_username] || '').trim();
+      const bestName = (row[idx.display_name] || '').trim() || statlockerUsername;
+      return {
+        accountId,
+        discordId: (row[idx.discord_id] || '').trim(),
+        nationality: (row[idx.nationality] || '').trim(),
+        bestName,
+        otherNames: [statlockerUsername].filter((n) => n && n !== bestName),
+      };
+    }
+  );
 }
 
 // --- Control Sheet roster migration -------------------------------------
@@ -672,7 +726,7 @@ const ROSTER_MAIN_SLOT_COUNT = 6;
 const ROSTER_SUBCOACH_SLOT_COUNT = 2;
 const ROSTER_DEFAULT_GUTTER = 1;
 // Matches a {{...}} token, capturing its inner text. Run against a cell's
-// text AFTER protectEscapes_() has swapped out {{{{ / }}}} literal-brace
+// text AFTER protectRosterEscapes_() has swapped out {{{{ / }}}} literal-brace
 // escapes, so this never mistakes an escape for a tag.
 const ROSTER_TAG_RE = /\{\{\s*([^{}]*?)\s*\}\}/g;
 const ROSTER_ESCAPE_OPEN = '\u0001';
@@ -1245,7 +1299,7 @@ function runRosterTemplate_(ghost, includeSeeding) {
 
 
 /**
- * Runs both migrations above in sequence - the normal entry point for
+ * Runs all three migrations above in sequence - the normal entry point for
  * "archive a finished event" (see README's "Migrating a finished event").
  * Doesn't clear Teams afterward; that's still a manual step (delete the
  * data rows below the header) so nothing here can delete real data.
@@ -1253,11 +1307,26 @@ function runRosterTemplate_(ghost, includeSeeding) {
  * Callable two ways: from the Apps Script editor directly (return value is
  * just discarded), or over HTTP via doPost's "migrateFinishedEvent" action -
  * see scripts/postEvent.js, which is the normal way to run this now.
+ *
+ * `players` combines both player-identity sources that feed PlayerDB -
+ * PlayerRegistry (rostered players) and FreeAgents (players who signed up
+ * without a team) - since both ultimately answer the same question
+ * ("who's on file, and under what name"). Each source is migrated
+ * separately (migratePlayerRegistryToPlayerDB/migrateFreeAgentsToPlayerDB)
+ * so an account_id present in both still merges into one PlayerDB row
+ * rather than colliding.
  */
 function migrateFinishedEvent() {
+  const teams = migrateTeamsToTeamDB();
+  const registryResult = migratePlayerRegistryToPlayerDB();
+  const freeAgentResult = migrateFreeAgentsToPlayerDB();
   return {
-    teams: migrateTeamsToTeamDB(),
-    players: migratePlayerRegistryToPlayerDB(),
+    teams,
+    players: {
+      updated: registryResult.updated + freeAgentResult.updated,
+      appended: registryResult.appended + freeAgentResult.appended,
+      skippedBlank: registryResult.skippedBlank + freeAgentResult.skippedBlank,
+    },
   };
 }
 
@@ -1485,8 +1554,6 @@ function doPost(e) {
     switch (body.action) {
       case 'getTable':
         return jsonResponse_(getTable_(body.tab));
-      case 'appendRow':
-        return jsonResponse_(appendRow_(body.tab, body.row));
       case 'updateRow':
         return jsonResponse_(updateRow_(body.tab, body.rowNumber, body.row));
       case 'getAllTables':
@@ -1551,11 +1618,6 @@ function sanitizeRow_(row) {
 
 function sanitizeRows_(rows) {
   return rows.map(sanitizeRow_);
-}
-
-function appendRow_(tabName, row) {
-  getSheet_(tabName).appendRow(sanitizeRow_(row));
-  return { ok: true };
 }
 
 function updateRow_(tabName, rowNumber, row) {

@@ -53,6 +53,12 @@ function create(threadId, initial) {
     teamRoleId: initial.teamRoleId || null, // null = brand new team, no role yet
     teamName: initial.teamName || null,
     isNewTeam: !!initial.isNewTeam,
+    // true once the captain has chosen "I am a Free Agent" instead of
+    // registering/joining a team - see registrationFlow.js's handleFreeAgent.
+    // Reuses pendingSlot (below, via update()) as the free agent's
+    // in-progress player data during collection, same shape as a roster
+    // slot's pendingSlot minus slotType/replaceIndex.
+    isFreeAgent: !!initial.isFreeAgent,
     // roster: array of { accountId, slotType, statlockerUsername, displayName,
     //   discordId, status: 'keep' | 'new' | 'renamed' | 'discard' }
     roster: initial.roster || [],

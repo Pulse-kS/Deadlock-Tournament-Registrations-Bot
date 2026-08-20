@@ -9,7 +9,7 @@ roles + a Google Sheet backend automatically.
 running bot. This document covers the same ground in more depth, plus
 Docker, remote updates, and everything else.
 
-## Status: 20260817-03
+## Status: 20260819-05
 
 Core registration flow (new team, edit existing team, keep/rename/discard
 per slot, Steam ID resolution, statlocker lookup, nationality capture, role
@@ -50,6 +50,7 @@ need to do steps 3-5 below (Discord permissions, Apps Script setup,
    - `STAFF_ROLE_ID` - role pinged when the bot needs manual intervention, and on every completed registration. Accepts a comma-separated list of role IDs (e.g. `123,456`) if you want more than one role to get pings/permissions - every listed role is treated equally everywhere staff role is checked (voice channel access, `/refresh`/`/config` permission, pings).
    - `ADMIN_ROLE_ID` - optional, same comma-separated shape as `STAFF_ROLE_ID`. Gets every permission `STAFF_ROLE_ID` does (team voice channel access, `/refresh`, `/config`) but is deliberately never pinged - see "Staff vs admin" below.
    - `PARTICIPANT_ROLE_ID` - optional. Role granted to every player on a completed registration, separate from per-team roles, for easier broad tournament permissions. Leave unset if you don't want this - the bot logs a notice on startup either way so it's clear whether it's active. Also settable at runtime via `/config participant-role`.
+   - `FREE_AGENT_ROLE_ID` - optional. Role granted to a player who signs up via `/register`'s "I am a Free Agent" path instead of registering/joining a team. Same "unset is fine" treatment as `PARTICIPANT_ROLE_ID`, also settable at runtime via `/config free-agent-role`.
    - `TEAM_VC_CATEGORY_ID` - optional. Category channel ID a brand new team's private voice channel gets created under (visible/connectable to staff and that team's own role only, hidden from everyone else). Left unset, teams simply don't get a voice channel - same "notice either way on startup" treatment as `PARTICIPANT_ROLE_ID`. A returning team's channel is reused rather than duplicated (tracked via the `vc_channel_id` column - see the Google Sheet schema section), and if that channel was deleted since, a new one is created in its place. The welcome message posted in the channel the moment it's first created is only ever sent that once - not on later re-registrations - and is configurable via `TEAM_VC_WELCOME_MESSAGE` (`{team}` is replaced with the team name); a reasonable default is used if unset. Both are also settable at runtime via `/config team-vc-category`/`/config team-vc-welcome-message`.
    - `APPS_SCRIPT_URL`, `APPS_SCRIPT_SECRET` - see "Google Apps Script setup" below, its own multi-step setup, not just an env var
    - `SHEETS_SYNC_INTERVAL_MINUTES` - optional, defaults to `60`. See "Local-first Sheets storage" below before changing this.
@@ -323,6 +324,16 @@ local store, then flushed to Google Sheets immediately - both
 `teams.createTeam`/`updateTeam` and `registry.upsertPlayer` are idempotent,
 so replaying an already-synced job is harmless.
 
+A narrower crash window exists earlier than that: a commit's Discord role/
+voice-channel/logo changes happen before the roster is known to be fully
+resolved (e.g. before a new voice channel's ID is known), so a crash during
+that window isn't a completed job yet. A lightweight *intent* record
+(which team, which thread - not a full job) is saved before any of that
+Discord work starts, specifically so this window still leaves a trace
+instead of nothing. This intent isn't auto-replayed on startup (see
+"Finishing registration" below for why), but a leftover one is detected and
+flagged to staff in the relevant thread.
+
 `sheets-snapshot.json` (written after every commit, plus a
 `LOCAL_SNAPSHOT_INTERVAL_MINUTES` timer, default 2, as a backstop for
 anything not tied to a commit) is a secondary, manual-only fallback for
@@ -444,6 +455,19 @@ names) specifically so post-event migration is a straight row copy - see
 the currently-running event; once it wraps, rows get migrated to `TeamDB`
 by staff and this tab starts fresh for the next event.
 
+**FreeAgents**
+| account_id | discord_id | display_name | nationality | statlocker_username | wants_team |
+|---|---|---|---|---|---|
+One row per player who signed up via `/register`'s "I am a Free Agent"
+path (`promptNewOrJoin` in `registrationFlow.js`) instead of registering or
+joining a team - no roster slot, no team role, no voice channel. `wants_team`
+is `Yes`/`No` - whether they asked staff to try assigning them to a team, or
+they only want to be available as an emergency substitute. Keyed by
+`account_id` same as everywhere else - re-registering as a free agent updates
+the existing row rather than adding a duplicate. Player identity itself
+(name/nationality/Discord link) is still also written to `PlayerRegistry` as
+usual, same as a rostered player.
+
 #### Migrating a finished event
 
 Once signups close, `Teams`' `p1`-`p6` columns being live account_ids
@@ -460,16 +484,19 @@ script reading columns straight off `Teams`, same as you've done against
    steps - each is also safe to do on its own if you only want one:
    - Calls the Apps Script web app's `migrateFinishedEvent` action, which
      copies `Teams` into `TeamDB` (matched by `team_role_id`; an existing
-     team's row is updated in place rather than duplicated) and
-     `PlayerRegistry` into `PlayerDB` (matched by `account_id`; any name/
-     Discord ID change is archived into `past_igns`/`past_discord_names`
-     rather than lost). Only writes to `TeamDB`/`PlayerDB` - `Teams` and
-     `PlayerRegistry` are untouched, so it's safe to re-run. Requires the
+     team's row is updated in place rather than duplicated) and both
+     `PlayerRegistry` and `FreeAgents` into `PlayerDB` (matched by
+     `account_id`; any name/Discord ID change is archived into
+     `past_igns`/`past_discord_names` rather than lost - an account present
+     in both source tabs still merges into a single `PlayerDB` row). Only
+     writes to `TeamDB`/`PlayerDB` - `Teams`, `PlayerRegistry`, and
+     `FreeAgents` are all untouched, so it's safe to re-run. Requires the
      Code.gs deployment to include this action - redeploy (Manage
      deployments > edit > new version) after pulling in a `Code.gs` version
-     that added it. `migrateTeamsToTeamDB()` and
-     `migratePlayerRegistryToPlayerDB()` remain callable individually from
-     the Apps Script editor too, same as before.
+     that added it. `migrateTeamsToTeamDB()`,
+     `migratePlayerRegistryToPlayerDB()`, and `migrateFreeAgentsToPlayerDB()`
+     remain callable individually from the Apps Script editor too, same as
+     before.
    - Archives `audit.log` locally (renamed to `audit-<label>.log`, not
      deleted) so a new one starts clean for the next event.
    The two steps are deliberately independent - if the Sheets migration
@@ -626,16 +653,25 @@ before showing the captain anything:
   captain is told "done" immediately - that's the part they can actually see
   and the part that matters for being let into the tournament. The Sheets
   write (Teams/PlayerRegistry rows) happens afterward, detached from
-  the interaction, so the captain isn't stuck waiting on Apps Script. The
-  job is written to `pending-writes.json` (gitignored, local) *before* that
-  write is even attempted, not just if it fails - so a hard crash (killed
-  process, OOM, host reboot) at any point after Finish is clicked still
-  can't lose the roster; the bot retries everything left in that queue
-  automatically on its next startup. It's removed from the queue the moment
-  the write actually succeeds. Roles being live before the sheet write lands
-  means there's a brief window where Discord and the sheet disagree -
-  acceptable for a personal-use tool, but worth knowing about if you ever
-  build automation that trusts the sheet as always-current.
+  the interaction, so the captain isn't stuck waiting on Apps Script. A
+  commit *intent* (which team, which thread) is written to
+  `pending-writes.json` (gitignored, local) *before any of that Discord role/
+  voice-channel/logo work starts* - not just before the Sheets write - so a
+  hard crash (killed process, OOM, host reboot) at any point after Finish is
+  clicked leaves a durable trace that this commit was interrupted, not
+  nothing. That intent record is upgraded in place to the full write job
+  (roster, resolved logo/VC) once the Discord side effects finish, and it's
+  removed from the queue the moment the Sheets write actually succeeds. On
+  the next startup, any commit that never made it past the intent stage gets
+  flagged to staff in its thread rather than replayed automatically - role
+  changes are safe to blindly redo, but voice-channel creation isn't (no way
+  to tell if one was already created before the crash), so recovering from
+  one of these is a manual step: check Discord, then either re-run
+  `/register` or fix it by hand. Roles being live before the sheet write
+  lands means there's still a brief window where Discord and the sheet
+  disagree even on the happy path - acceptable for a personal-use tool, but
+  worth knowing about if you ever build automation that trusts the sheet as
+  always-current.
 
 ## New team role creation
 
@@ -691,11 +727,12 @@ to set at all - leave it unset if you don't need the distinction.
 
 - `/config` - staff/admin. Changes a hand-picked set of Discord-side
   settings at runtime, no `.env` edit or restart needed: `registration-channel`,
-  `participant-role`, `team-vc-category`, `team-vc-welcome-message` (each
-  takes the new value directly - channel/role ones use Discord's native
-  picker so only a real channel/role of the right type can ever be chosen),
-  `view` (current value of all four, and whether each is overridden or
-  still at its `.env` default), and `reset` (revert one setting back to its
+  `participant-role`, `free-agent-role`, `team-vc-category`,
+  `team-vc-welcome-message` (each takes the new value directly -
+  channel/role ones use Discord's native picker so only a real channel/role
+  of the right type can ever be chosen), `view` (current value of all five,
+  and whether each is overridden or still at its `.env` default), and
+  `reset` (revert one setting back to its
   `.env` value). Every change is written to `audit.log` (before/after
   value, who made it). Overrides persist in `config-overrides.json` next to
   `sessions.json`/`audit.log` - delete that file (or `/config reset` each

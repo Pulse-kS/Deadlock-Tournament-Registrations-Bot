@@ -146,15 +146,14 @@ async function promptNewOrJoin(thread, member) {
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('reg:new_team').setLabel('Register New Team').setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
-      .setCustomId('reg:join_existing')
-      .setLabel('Join an Existing Team')
+      .setCustomId('reg:free_agent')
+      .setLabel('I am a Free Agent')
       .setStyle(ButtonStyle.Secondary)
   );
 
   await thread.send({
     content:
-      `${member}, are you registering a **brand new team**, or joining a team that already exists?\n\n` +
-      `Joining an existing team requires staff confirmation, since only current team members can self-edit a roster.`,
+      `${member}, are you registering a **brand new team**, or signing up as a **free agent** (no team of your own)?`,
     components: [row],
   });
 }
@@ -626,7 +625,9 @@ async function renderControlPanel(thread) {
 // ---------------------------------------------------------------------------
 
 // customIds that only make sense mid-way through adding/editing a single
-// roster slot - see the pendingSlot guard in handleComponent below.
+// roster slot, or mid-way through a free agent sign-up (which reuses
+// pendingSlot as its own in-progress player data - see handleFreeAgent) -
+// see the pendingSlot guard in handleComponent below.
 const PENDING_SLOT_REQUIRED_IDS = new Set([
   'reg:select:slot_type',
   'reg:select:slot_only',
@@ -638,6 +639,8 @@ const PENDING_SLOT_REQUIRED_IDS = new Set([
   'reg:linkage:skip',
   'reg:retry_nationality',
   'reg:continue_nationality',
+  'reg:free_agent:wants_team',
+  'reg:free_agent:emergency_sub',
 ]);
 
 async function handleComponent(interaction) {
@@ -683,7 +686,9 @@ async function handleComponent(interaction) {
   if (id === 'reg:new_team') return handleNewTeam(interaction, session);
   if (id === 'reg:continue_existing') return handleContinueExisting(interaction, session);
   if (id === 'reg:leave_and_register_new') return handleLeaveAndRegisterNew(interaction, session);
-  if (id === 'reg:join_existing') return handleJoinExisting(interaction, session);
+  if (id === 'reg:free_agent') return handleFreeAgent(interaction, session);
+  if (id === 'reg:free_agent:wants_team') return finalizeFreeAgent(interaction, session, true);
+  if (id === 'reg:free_agent:emergency_sub') return finalizeFreeAgent(interaction, session, false);
   if (id === 'reg:add_slot') return promptAddSlot(interaction);
   if (id === 'reg:rename_team') return promptRenameTeam(interaction);
   if (id === 'reg:team_logo') return promptTeamLogo(interaction, session);
@@ -716,12 +721,17 @@ async function handleNewTeam(interaction, session) {
   await promptRenameTeam(interaction);
 }
 
-async function handleJoinExisting(interaction, session) {
-  await interaction.update({ content: 'Request sent to staff - Please tell them which team you are on.', components: [] });
-  await pingStaff(
-    interaction.channel,
-    `${interaction.user} wants to join an existing team but holds no team role. Please confirm which team, then either have a current team member add them via /register, or grant them the team role directly.`
-  );
+/**
+ * Starts the free agent flow: a single-player signup with no team, no team
+ * role, and no voice channel - just identity + a "want a team or emergency
+ * sub only" answer (see promptFreeAgentTeamQuestion/finalizeFreeAgent).
+ * Reuses promptAddSlot's Statlocker ID modal (same lookup pipeline as a
+ * roster slot) with a distinct modal customId so handleModalSubmit can
+ * route it down the free-agent path instead of the roster one.
+ */
+async function handleFreeAgent(interaction, session) {
+  sessions.update(interaction.channel.id, { isFreeAgent: true });
+  await promptAddSlot(interaction, 'Free Agent Sign-Up', 'reg:modal:free_agent_id');
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,8 +1057,8 @@ async function resolveLogoUrl(thread, session) {
 // Add / rename slot: Steam ID modal -> slot type select -> discord linkage
 // ---------------------------------------------------------------------------
 
-async function promptAddSlot(interaction, title = 'Add Player') {
-  const modal = new ModalBuilder().setCustomId('reg:modal:add_slot').setTitle(title);
+async function promptAddSlot(interaction, title = 'Add Player', modalId = 'reg:modal:add_slot') {
+  const modal = new ModalBuilder().setCustomId(modalId).setTitle(title);
   const input = new TextInputBuilder()
     .setCustomId('steam_id')
     .setLabel('Statlocker ID / Steam Friend Code')
@@ -1334,14 +1344,94 @@ async function handleModalSubmit(interaction) {
       content,
       components: [selectRow],
     });
+    return;
+  }
+
+  if (interaction.customId === 'reg:modal:free_agent_id') {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const rawInput = interaction.fields.getTextInputValue('steam_id').trim();
+
+    let accountId;
+    try {
+      const resolved = await steamService.resolveSteamId(rawInput);
+      accountId = resolved.accountId;
+    } catch (err) {
+      await interaction.editReply({ content: `Couldn't resolve that Steam ID: ${err.message}` });
+      return;
+    }
+
+    // A free agent isn't building a roster, but they can still already be
+    // on someone else's live team (e.g. re-registering with a different
+    // intent by mistake) - same conflict check as adding a roster slot,
+    // and same reasoning: staff needs to sort out which registration is
+    // authoritative, not the bot guessing.
+    const conflictingTeam = await teams.findTeamContainingAccountId(accountId);
+    if (conflictingTeam) {
+      await interaction.editReply({
+        content: `**${accountId}** is already on **${conflictingTeam.team_name}**'s roster - can't also sign up as a free agent. Contact staff if this needs sorting out.`,
+      });
+      return;
+    }
+
+    let lookup;
+    try {
+      lookup = await statlocker.lookupPlayer(accountId);
+    } catch (err) {
+      if (err instanceof StatlockerLookupError) {
+        await interaction.editReply({ content: `statlocker.gg lookup failed: ${err.message}` });
+      } else {
+        await interaction.editReply({ content: `Unexpected error during statlocker lookup: ${err.message}` });
+      }
+      return;
+    }
+
+    const { player, flagged } = await registry.upsertPlayer(
+      { accountId, statlockerUsername: lookup.username },
+      { tournamentName: '', discordUserTag: interaction.user.tag }
+    );
+
+    if (flagged) {
+      await pingStaff(
+        thread,
+        `Name mismatch for account ID ${accountId}: statlocker now reports **${lookup.username}**, which doesn't match what's on file. ` +
+          `Using on-file name for this free agent sign-up until reviewed. Flagged in the Flags tab for review.`
+      );
+    }
+
+    const dbHistory = await playerDB.getPlayerRecord(accountId);
+    const registryHistory =
+      player && (player.display_name || player.discord_id)
+        ? { bestName: player.display_name || '', discordId: player.discord_id || '', nationality: player.nationality || '', pastIgns: '' }
+        : null;
+    const history = dbHistory || registryHistory;
+
+    sessions.update(thread.id, {
+      pendingSlot: {
+        accountId,
+        statlockerUsername: lookup.username,
+        nationality: player.nationality || (history && history.nationality) || '',
+        suggestedDisplayName: (history && history.bestName) || '',
+        // Discord linkage is never asked for a free agent - it's always
+        // the captain who ran /register themselves (see finalizeFreeAgent).
+        historyDiscordId: '',
+      },
+    });
+
+    const { buttons } = buildNameChoiceButtons(sessions.get(thread.id).pendingSlot);
+    let content = `Found **${lookup.username}**. What name should we use for you?`;
+    if (dbHistory && dbHistory.pastIgns) {
+      content += `\n📜 Player Database: past name(s) on file - ${dbHistory.pastIgns}`;
+    }
+
+    await interaction.editReply({
+      content,
+      components: [new ActionRowBuilder().addComponents(buttons)],
+    });
   }
 }
 
-async function handleSlotTypeSelect(interaction, session) {
-  const slotType = interaction.values[0];
-  const pending = { ...session.pendingSlot, slotType };
-  sessions.update(interaction.channel.id, { pendingSlot: pending });
-
+/** Shared by handleSlotTypeSelect and the free agent flow (see handleFreeAgentId) - the Keep/Use-saved/Custom name choice buttons. */
+function buildNameChoiceButtons(pending) {
   const hasHistoricalName =
     pending.suggestedDisplayName && pending.suggestedDisplayName !== pending.statlockerUsername;
 
@@ -1361,6 +1451,15 @@ async function handleSlotTypeSelect(interaction, session) {
       .setStyle(ButtonStyle.Secondary)
   );
   buttons.push(new ButtonBuilder().setCustomId('reg:name:custom').setLabel('Pick a different name').setStyle(ButtonStyle.Primary));
+  return { buttons, hasHistoricalName };
+}
+
+async function handleSlotTypeSelect(interaction, session) {
+  const slotType = interaction.values[0];
+  const pending = { ...session.pendingSlot, slotType };
+  sessions.update(interaction.channel.id, { pendingSlot: pending });
+
+  const { buttons, hasHistoricalName } = buildNameChoiceButtons(pending);
 
   await interaction.update({
     content:
@@ -1427,6 +1526,16 @@ async function goToNationalityStep(interaction, session) {
 async function proceedPastNationality(interaction, session, code, opts = {}) {
   const thread = interaction.channel;
 
+  sessions.update(thread.id, { pendingSlot: { ...session.pendingSlot, nationality: code } });
+
+  // A free agent needs no Discord-linkage step - it's always the captain
+  // who ran /register themselves - so skip straight to the team/emergency-
+  // sub question instead of the Tag/Skip buttons below.
+  if (session.isFreeAgent) {
+    await promptFreeAgentTeamQuestion(interaction, code, opts);
+    return;
+  }
+
   // Check the Discord ID the Player Database has on file for this player
   // against the current guild - only offer it as a linkage option if it
   // actually resolves to someone present in this server right now, rather
@@ -1460,6 +1569,99 @@ async function proceedPastNationality(interaction, session, code, opts = {}) {
     components: [new ActionRowBuilder().addComponents(linkageButtons)],
     flags: MessageFlags.Ephemeral,
   });
+}
+
+/** Last question before a free agent sign-up finalizes - see proceedPastNationality. */
+async function promptFreeAgentTeamQuestion(interaction, code, opts = {}) {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('reg:free_agent:wants_team').setLabel('Assign me a team').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('reg:free_agent:emergency_sub').setLabel('Emergency sub only').setStyle(ButtonStyle.Secondary)
+  );
+
+  await interaction.reply({
+    content:
+      `Nationality set to **${code}**${opts.skipped ? ' (already on file - skipped asking)' : ''}. Last question: would you like ` +
+      `staff to try assigning you to a team, or are you only available as an emergency substitute?`,
+    components: [row],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+/**
+ * Commits a free agent sign-up: no team role, no team, no voice channel -
+ * just a FreeAgents row, the free agent Discord role (if configured), and a
+ * PlayerRegistry identity update, same crash-safe queued-write pattern as
+ * performCommit/writeToSheets use for team registrations (see
+ * writeFreeAgentToSheets).
+ */
+async function finalizeFreeAgent(interaction, session, wantsTeam) {
+  const thread = interaction.channel;
+  const pending = session.pendingSlot;
+  if (!pending) {
+    await interaction.reply({ content: 'Something went out of sync - please start again with **I am a Free Agent**.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  await interaction.deferUpdate();
+
+  // Same commit-intent pattern as performCommit - see that function's
+  // comment. Saved before the role grant below, upgraded to the full
+  // writeJob (same queue entry id) once it's built.
+  const intentId = pendingWrites.save({
+    stage: 'committing',
+    accountId: pending.accountId,
+    teamName: pending.displayName || pending.statlockerUsername,
+    threadId: thread.id,
+    actorTag: interaction.user.tag,
+  });
+
+  const roleFailures = await teams.applyFreeAgentRole(interaction.guild, session.sessionOwnerId);
+  if (roleFailures.length) {
+    await pingStaff(
+      thread,
+      `Could not grant the free agent role to ${interaction.user}: ${roleFailures[0].error.message || roleFailures[0].error}`
+    ).catch(() => {});
+  }
+
+  const writeJob = {
+    id: intentId,
+    type: 'freeAgent',
+    accountId: pending.accountId,
+    discordId: session.sessionOwnerId,
+    displayName: pending.displayName || pending.statlockerUsername,
+    nationality: pending.nationality || '',
+    statlockerUsername: pending.statlockerUsername,
+    wantsTeam,
+    actorTag: interaction.user.tag,
+  };
+
+  auditLog.record(interaction.user.id, interaction.user.tag, 'registration.free_agent_commit', {
+    threadId: thread.id,
+    accountId: pending.accountId,
+    wantsTeam,
+  });
+
+  // Same crash-safety ordering as performCommit: save to disk before the
+  // write is even attempted, so a hard crash between here and a completed
+  // write still has something to replay on restart.
+  const jobId = pendingWrites.save(writeJob);
+  writeJob.id = jobId;
+
+  sessions.clear(thread.id);
+  writeFreeAgentToSheets(writeJob, thread); // deliberately not awaited - see writeToSheets
+
+  await interaction.editReply({
+    content:
+      `You're signed up as a free agent as **${writeJob.displayName}**${wantsTeam ? ' - staff will try to place you on a team.' : ' (emergency sub only).'}`,
+    components: [],
+  });
+
+  await pingStaff(
+    thread,
+    `${interaction.user} signed up as a free agent (**${writeJob.displayName}**) - ${wantsTeam ? 'wants a team assigned.' : 'available as an emergency sub only.'}`
+  );
+
+  scheduleArchive(thread);
 }
 
 async function promptCustomDisplayName(interaction, session) {
@@ -1963,6 +2165,22 @@ async function performCommit(guild, thread, session, teamRoleId, actorTag, actor
   // the captain is a player, so it shouldn't also grant the participant role.
   const desiredDiscordIds = [...new Set([...rosterDiscordIds, session.sessionOwnerId])];
 
+  // Persist a commit *intent* before any Discord side effect below - not
+  // just before the Sheets write (compare the pendingWrites.save() call
+  // further down, which upgrades this same entry once the real writeJob is
+  // built). Without this, a hard crash between the role/VC/logo changes
+  // below and that later save would leave Discord already changed with no
+  // durable record anywhere that it happened - see checkStaleCommitIntents,
+  // which is what notices a leftover 'committing'-stage entry like this on
+  // the next startup and flags it for staff instead of silently losing it.
+  const intentId = pendingWrites.save({
+    stage: 'committing',
+    teamRoleId,
+    teamName: session.teamName,
+    threadId: thread.id,
+    actorTag,
+  });
+
   const roleFailures = await teams.reconcileTeamRole(guild, teamRoleId, desiredDiscordIds);
   if (roleFailures.length) {
     const lines = roleFailures.map(
@@ -2003,6 +2221,7 @@ async function performCommit(guild, thread, session, teamRoleId, actorTag, actor
   }
 
   const writeJob = {
+    id: intentId, // upgrades the intent record above in place, same queue entry
     teamRoleId,
     teamName: session.teamName,
     roster: session.roster,
@@ -2011,12 +2230,13 @@ async function performCommit(guild, thread, session, teamRoleId, actorTag, actor
     actorTag,
   };
 
-  // Persist to disk BEFORE attempting the write, not just if it fails - if
-  // this only happened in writeToSheets' catch block, a hard crash (killed
-  // process, OOM) between here and a completed write would throw nothing
-  // catchable, and the job would never make it to pending-writes.json at
-  // all. Saving synchronously first closes that gap: from this line on, the
-  // roster survives a full bot crash no matter where it happens.
+  // Re-persist to disk now that the write job is complete (logoUrl/
+  // vcChannelId resolved) - not just if the write below fails. If this only
+  // happened in writeToSheets' catch block, a hard crash (killed process,
+  // OOM) between here and a completed write would throw nothing catchable,
+  // and the job would never make it past the 'committing'-stage intent
+  // above. Saving synchronously first closes that gap: from this line on,
+  // the roster survives a full bot crash no matter where it happens.
   const jobId = pendingWrites.save(writeJob);
   writeJob.id = jobId;
 
@@ -2113,6 +2333,55 @@ async function writeToSheets(job, thread) {
   flushSoon();
 }
 
+/**
+ * Free agent equivalent of writeToSheets above - same fire-and-forget,
+ * never-throws-outward, queue-on-failure shape, just against the
+ * FreeAgents tab (and PlayerRegistry) instead of Teams. Looks up any
+ * existing FreeAgents row for this account_id first so re-running this
+ * (e.g. a retried pending write, or someone re-registering as a free
+ * agent) updates in place rather than appending a duplicate row.
+ */
+async function writeFreeAgentToSheets(job, thread) {
+  const tab = config.sheets.tabs.freeAgents;
+  try {
+    const row = {
+      account_id: job.accountId,
+      discord_id: job.discordId,
+      display_name: job.displayName,
+      nationality: job.nationality,
+      statlocker_username: job.statlockerUsername,
+      wants_team: job.wantsTeam ? 'Yes' : 'No',
+    };
+
+    const existing = await sheets.findRow(tab, (r) => r.account_id === job.accountId);
+    if (existing) {
+      await sheets.updateRow(tab, existing._rowNumber, row);
+    } else {
+      await sheets.appendRow(tab, row);
+    }
+
+    await registry.upsertPlayer(
+      { accountId: job.accountId, statlockerUsername: job.statlockerUsername, discordId: job.discordId, nationality: job.nationality, displayName: job.displayName },
+      { discordUserTag: job.actorTag }
+    );
+  } catch (err) {
+    const id = pendingWrites.save(job);
+    console.error(`[writeFreeAgentToSheets] Failed for ${job.displayName} (queued as ${id}):`, err.message);
+    if (thread) {
+      await pingStaff(
+        thread,
+        `Sheet write failed for free agent **${job.displayName}** after Discord roles were already updated: ${err.message}\n` +
+          `Saved locally (queue id \`${id}\`) - the bot will retry automatically on next restart, or ask whoever runs the bot to check \`pending-writes.json\`.`
+      ).catch(() => {});
+    }
+  }
+
+  localSnapshot.writeSnapshot().catch((err) => {
+    console.error(`[writeFreeAgentToSheets] Local snapshot write failed: ${err.message}`);
+  });
+  flushSoon();
+}
+
 function flushSoon() {
   const flushStartedAt = Date.now();
   sheets
@@ -2127,11 +2396,64 @@ function flushSoon() {
 
 /** Called on bot startup to retry anything left in the queue from a previous failure. */
 async function retryPendingWrites() {
-  const jobs = pendingWrites.listAll();
+  // 'committing'-stage entries are commit intents, not completed jobs (see
+  // performCommit/finalizeFreeAgent) - they have no roster/logoUrl/etc yet,
+  // so attempting to write one here would throw. checkStaleCommitIntents
+  // handles these instead (called separately, before this, at startup).
+  const jobs = pendingWrites.listAll().filter((job) => job.stage !== 'committing');
   for (const job of jobs) {
-    await writeToSheets(job, null);
+    if (job.type === 'freeAgent') {
+      await writeFreeAgentToSheets(job, null);
+    } else {
+      await writeToSheets(job, null);
+    }
   }
   return jobs.length;
+}
+
+/**
+ * Startup-only check for a commit that crashed between the intent record
+ * (saved just before any Discord side effect - see performCommit/
+ * finalizeFreeAgent) and the completed write job (saved once those side
+ * effects finish, upgrading the same queue entry in place). A surviving
+ * 'committing'-stage entry at startup means exactly that gap was hit:
+ * Discord may already be partly updated for this commit, but nothing ever
+ * reached Sheets.
+ *
+ * Deliberately does NOT try to auto-replay the Discord side effects -
+ * role changes are safe to blindly re-run (reconcileTeamRole/
+ * applyParticipantRole/applyFreeAgentRole all only add/remove what's
+ * actually missing/extra), but voice channel creation is not: without
+ * knowing whether a channel already got created before the crash, blindly
+ * re-running resolveVcChannel risks creating a duplicate. Flagging it for a
+ * human to check once is a much smaller risk than the bot silently
+ * guessing wrong. Never auto-removes the stale entry either - re-running
+ * /register produces a fresh commit (and a fresh intent record) rather
+ * than resuming this one, so this is left for manual cleanup as a visible
+ * trail of what happened, same as any other unresolved pending-writes.json
+ * entry.
+ *
+ * Call once at startup, before retryPendingWrites.
+ */
+async function checkStaleCommitIntents(client) {
+  const stale = pendingWrites.listAll().filter((job) => job.stage === 'committing');
+  for (const job of stale) {
+    const label = job.teamName || job.accountId || job.id;
+    console.error(
+      `[registrationFlow] Found a commit that didn't finish before the last restart ("${label}") - Discord may already be ` +
+        `partly updated for this but nothing was written to Sheets yet. Queue id: ${job.id}.`
+    );
+    const thread = job.threadId ? await client.channels.fetch(job.threadId).catch(() => null) : null;
+    if (thread) {
+      await pingStaff(
+        thread,
+        `The bot restarted mid-commit for **${label}** - Discord roles/VC may already be partly updated, but nothing was ` +
+          `written to Sheets yet. Please check this team's/player's Discord state, then either re-run \`/register\` to redo ` +
+          `the commit, or ask whoever runs the bot to check \`pending-writes.json\` (queue id \`${job.id}\`).`
+      ).catch(() => {});
+    }
+  }
+  return stale.length;
 }
 
 /**
@@ -2145,6 +2467,11 @@ async function retryPendingWrites() {
  */
 function clearPendingWritesSyncedBefore(cutoffMs) {
   for (const job of pendingWrites.listAll()) {
+    // Never clear a 'committing'-stage intent this way - it isn't a
+    // completed job that a flush could have synced, so an old savedAt here
+    // just means the commit crashed a while ago, not that it's resolved.
+    // See checkStaleCommitIntents for how these actually get cleared.
+    if (job.stage === 'committing') continue;
     if (job.savedAt <= cutoffMs) pendingWrites.remove(job.id);
   }
 }
@@ -2183,4 +2510,5 @@ module.exports = {
   handleMessage,
   retryPendingWrites,
   clearPendingWritesSyncedBefore,
+  checkStaleCommitIntents,
 };

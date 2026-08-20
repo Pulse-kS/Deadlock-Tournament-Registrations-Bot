@@ -155,6 +155,20 @@ client.once('clientReady', async () => {
     }
   }
 
+  // Free agent role is optional too (see config.js) - same "say so loudly
+  // once" treatment as participant role above (see teams.applyFreeAgentRole).
+  if (!config.discord.freeAgentRoleId) {
+    console.log('No free agent role set (FREE_AGENT_ROLE_ID) - free agent sign-ups will not get a role.');
+  } else if (guild) {
+    const freeAgentRole = await guild.roles.fetch(config.discord.freeAgentRoleId).catch(() => null);
+    if (!freeAgentRole) {
+      console.error(
+        `FREE_AGENT_ROLE_ID (${config.discord.freeAgentRoleId}) does not match any role in this guild - ` +
+          `free agent sign-ups will not get a role until this is fixed.`
+      );
+    }
+  }
+
   // Team VC category is optional too (see config.js) - same "say so loudly
   // once" treatment as participant role above, since a bad/missing category
   // ID otherwise only surfaces as a silent skip on the first commit.
@@ -189,6 +203,15 @@ client.once('clientReady', async () => {
 
   await purgeStaleSessions('on startup');
   await announceUpdateIfPending();
+
+  // Before replaying anything below, check for a commit that crashed
+  // between its intent record and completion (see checkStaleCommitIntents)
+  // - Discord may already be partly changed for these, so staff need to
+  // know even though there's nothing here to safely auto-replay.
+  const staleCommits = await registrationFlow.checkStaleCommitIntents(client);
+  if (staleCommits > 0) {
+    console.error(`Found ${staleCommits} commit(s) that didn't finish before the last restart - staff notified in the relevant thread(s) where possible.`);
+  }
 
   const retried = await registrationFlow.retryPendingWrites();
   if (retried > 0) {

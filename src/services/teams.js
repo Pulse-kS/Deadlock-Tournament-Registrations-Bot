@@ -234,15 +234,15 @@ async function syncTeamRoleName(guild, teamRoleId, teamName) {
 }
 
 /**
- * Grants config.discord.participantRoleId to every given Discord user on a
- * completed registration - kept separate from per-team roles so staff can
- * gate broad tournament permissions (channels, event pings, etc) off one
- * role instead of the full list of team roles. No-ops per-member if
- * they're not in the guild or already have the role. Returns failures in
- * the same { discordId, action, error } shape as reconcileTeamRole.
+ * Shared grant-only helper: adds roleId to every given Discord user, no-op
+ * per-member if they're not in the guild, already have the role, or roleId
+ * itself is unset/unresolvable. Returns failures in the same
+ * { discordId, action, error } shape as reconcileTeamRole. Used by both
+ * applyParticipantRole and applyFreeAgentRole below - neither ever removes
+ * this kind of role, only grants it, so there's no "desired set" diffing
+ * needed the way reconcileTeamRole (per-team roles) requires.
  */
-async function applyParticipantRole(guild, discordIds) {
-  const roleId = config.discord.participantRoleId;
+async function grantRole(guild, roleId, discordIds, reason) {
   if (!roleId) return [];
   const role = await guild.roles.fetch(roleId).catch(() => null);
   if (!role) return [];
@@ -251,11 +251,30 @@ async function applyParticipantRole(guild, discordIds) {
   for (const id of new Set(discordIds.filter(Boolean))) {
     const member = await guild.members.fetch(id).catch(() => null);
     if (!member || member.roles.cache.has(roleId)) continue;
-    await member.roles.add(role, 'Completed tournament registration').catch((error) => {
+    await member.roles.add(role, reason).catch((error) => {
       failures.push({ discordId: id, action: 'add', error });
     });
   }
   return failures;
+}
+
+/**
+ * Grants config.discord.participantRoleId to every given Discord user on a
+ * completed registration - kept separate from per-team roles so staff can
+ * gate broad tournament permissions (channels, event pings, etc) off one
+ * role instead of the full list of team roles.
+ */
+async function applyParticipantRole(guild, discordIds) {
+  return grantRole(guild, config.discord.participantRoleId, discordIds, 'Completed tournament registration');
+}
+
+/**
+ * Grants config.discord.freeAgentRoleId to a player who signed up as a free
+ * agent (see registrationFlow.js's finalizeFreeAgent) - never a team role,
+ * never the participant role, since a free agent isn't (yet) on a roster.
+ */
+async function applyFreeAgentRole(guild, discordId) {
+  return grantRole(guild, config.discord.freeAgentRoleId, [discordId], 'Signed up as a free agent');
 }
 
 /**
@@ -294,6 +313,7 @@ module.exports = {
   reconcileTeamRole,
   syncTeamRoleName,
   applyParticipantRole,
+  applyFreeAgentRole,
   applyRoleOnJoin,
   rosterFromTeamRow,
   buildRosterColumns,

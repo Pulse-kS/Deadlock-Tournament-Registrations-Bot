@@ -81,6 +81,12 @@ module.exports = {
     )
     .addSubcommand((sub) =>
       sub
+        .setName('free-agent-role')
+        .setDescription('Set the role granted to players who sign up as a free agent.')
+        .addRoleOption((opt) => opt.setName('role').setDescription('New free agent role').setRequired(true))
+    )
+    .addSubcommand((sub) =>
+      sub
         .setName('team-vc-category')
         .setDescription("Set the category a new team's private voice channel is created under.")
         .addChannelOption((opt) => opt.setName('category').setDescription('New VC category').setRequired(true).addChannelTypes(ChannelType.GuildCategory))
@@ -139,6 +145,11 @@ module.exports = {
 
     if (sub === 'participant-role') {
       await applyChange(interaction, 'participantRoleId', interaction.options.getRole('role', true).id);
+      return;
+    }
+
+    if (sub === 'free-agent-role') {
+      await applyChange(interaction, 'freeAgentRoleId', interaction.options.getRole('role', true).id);
       return;
     }
 

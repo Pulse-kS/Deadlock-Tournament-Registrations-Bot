@@ -38,6 +38,11 @@ const FIELDS = {
     label: 'Participant role',
     type: 'role',
   },
+  freeAgentRoleId: {
+    envVar: 'FREE_AGENT_ROLE_ID',
+    label: 'Free agent role',
+    type: 'role',
+  },
   teamVcCategoryId: {
     envVar: 'TEAM_VC_CATEGORY_ID',
     label: 'Team VC category',

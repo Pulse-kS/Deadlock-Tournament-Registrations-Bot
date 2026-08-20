@@ -46,7 +46,7 @@ function persistAll(obj) {
 /** Saves a failed write job for later retry. Returns its id. */
 function save(job) {
   const all = loadAll();
-  const id = job.id || `${job.teamRoleId || 'unknown'}-${Date.now()}`;
+  const id = job.id || `${job.teamRoleId || job.accountId || 'unknown'}-${Date.now()}`;
   all[id] = { ...job, id, savedAt: job.savedAt || Date.now() };
   persistAll(all);
   return id;

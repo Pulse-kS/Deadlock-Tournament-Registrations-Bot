@@ -66,6 +66,7 @@ function parseNextcloudShare(envValue, password) {
 // fallback have no business re-evaluating every single read.
 const registrationChannelIdDefault = required('REGISTRATION_CHANNEL_ID');
 const participantRoleIdDefault = process.env.PARTICIPANT_ROLE_ID || null;
+const freeAgentRoleIdDefault = process.env.FREE_AGENT_ROLE_ID || null;
 const teamVcCategoryIdDefault = process.env.TEAM_VC_CATEGORY_ID || null;
 const teamVcWelcomeMessageDefault =
   process.env.TEAM_VC_WELCOME_MESSAGE || "Welcome, {role}! This is **{team}**'s private voice channel for the tournament. Thanks for signing up!";
@@ -112,6 +113,15 @@ module.exports = {
     get participantRoleId() {
       return runtimeConfig.resolve('participantRoleId', participantRoleIdDefault);
     },
+    // Optional - granted to a player who signs up as a free agent (see
+    // registrationFlow's finalizeFreeAgent) instead of joining/creating a
+    // team. Deliberately separate from participantRoleId - a free agent
+    // hasn't necessarily been placed on a team yet, so tournament
+    // permissions gated on "is playing" vs "is an unplaced free agent" can
+    // be told apart. Same "unset is valid, notice on startup" treatment.
+    get freeAgentRoleId() {
+      return runtimeConfig.resolve('freeAgentRoleId', freeAgentRoleIdDefault);
+    },
     // Optional - category a brand new team's private voice channel gets
     // created under (see teams.createTeamVoiceChannel). Unset is a valid
     // choice, same as participantRoleId above - VC creation is simply
@@ -146,6 +156,10 @@ module.exports = {
       // side - see services/playerDB.js and services/teamDB.js.
       playerDB: 'PlayerDB',
       teamDB: 'TeamDB',
+      // One row per player who signed up as a free agent (see
+      // registrationFlow's finalizeFreeAgent/writeFreeAgentToSheets) -
+      // separate from Teams, since a free agent isn't on a roster.
+      freeAgents: 'FreeAgents',
     },
   },
   statlocker: {
