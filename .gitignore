@@ -4,3 +4,9 @@ sessions.json
 sheets-snapshot.json 
 pending-writes.json 
 bot.lock
+config-overrides.json
+audit.log
+audit-*.log
+update-request.json
+update-ack.json
+update-failed.json

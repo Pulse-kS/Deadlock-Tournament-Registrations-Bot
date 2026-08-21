@@ -143,18 +143,21 @@ async function startNoTeamRoleFlow(thread, member) {
 
 /** The plain "new team or join existing" prompt - used when there's no Team Database match, or the captain says that match isn't them. */
 async function promptNewOrJoin(thread, member) {
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('reg:new_team').setLabel('Register New Team').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId('reg:free_agent')
-      .setLabel('I am a Free Agent')
-      .setStyle(ButtonStyle.Secondary)
-  );
+  const buttons = [new ButtonBuilder().setCustomId('reg:new_team').setLabel('Register New Team').setStyle(ButtonStyle.Primary)];
+  if (config.registration.freeAgentEnabled) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId('reg:free_agent')
+        .setLabel('I am a Free Agent')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
 
   await thread.send({
-    content:
-      `${member}, are you registering a **brand new team**, or signing up as a **free agent** (no team of your own)?`,
-    components: [row],
+    content: config.registration.freeAgentEnabled
+      ? `${member}, are you registering a **brand new team**, or signing up as a **free agent** (no team of your own)?`
+      : `${member}, click below to start registering your team.`,
+    components: [new ActionRowBuilder().addComponents(buttons)],
   });
 }
 
@@ -579,8 +582,18 @@ async function renderControlPanel(thread) {
         .setCustomId('reg:select:modify_slot')
         .setPlaceholder('Select a player to rename/remove')
         .addOptions(
+          // label falls back past statlockerUsername/displayName to
+          // accountId (always present) rather than risking an empty
+          // string: an existing team's roster is loaded from Teams'
+          // account_id columns + a PlayerRegistry lookup (loadTeamData),
+          // and if that account_id's PlayerRegistry row is ever missing
+          // (e.g. a prior commit's registry write got queued/retried and
+          // hasn't landed yet) statlockerUsername/displayName both come
+          // back blank - Discord rejects a select option with an empty
+          // label outright, which would break this whole panel instead
+          // of just showing an unhelpful option.
           modifiableSlots.slice(0, 25).map((r, i) => ({
-            label: r.statlockerUsername,
+            label: r.statlockerUsername || r.displayName || `Unknown player (${r.accountId})`,
             description: r.slotType,
             value: String(session.roster.indexOf(r)),
           }))
@@ -730,6 +743,18 @@ async function handleNewTeam(interaction, session) {
  * route it down the free-agent path instead of the roster one.
  */
 async function handleFreeAgent(interaction, session) {
+  // Guards against a stale button click - if this got toggled off
+  // (FREE_AGENT_SIGNUP_ENABLED=false) after this message was sent but
+  // before the captain clicked it, the button is no longer offered to
+  // anyone new, but this specific already-rendered message would still be
+  // clickable without this check.
+  if (!config.registration.freeAgentEnabled) {
+    await interaction.reply({
+      content: "Free agent sign-ups aren't open right now - click **Register New Team** instead, or ask staff if you think this is a mistake.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
   sessions.update(interaction.channel.id, { isFreeAgent: true });
   await promptAddSlot(interaction, 'Free Agent Sign-Up', 'reg:modal:free_agent_id');
 }
@@ -1815,16 +1840,20 @@ async function handleSlotAction(interaction, session, customId) {
   const [, , idxStr, action] = customId.split(':');
   const idx = parseInt(idxStr, 10);
 
-  if (action === 'keep') {
-    session.roster[idx].status = 'keep';
-    await interaction.update({ content: `Kept **${session.roster[idx].displayName || session.roster[idx].statlockerUsername}**.`, components: [] });
-    await renderControlPanel(interaction.channel);
-    return;
-  }
-
-  if (action === 'discard') {
-    session.roster[idx].status = 'discard';
-    await interaction.update({ content: `Removed **${session.roster[idx].displayName || session.roster[idx].statlockerUsername}**.`, components: [] });
+  // 'keep'/'discard' set a single slot's status via sessions.update (which
+  // persists to disk, same as every other roster change) rather than
+  // mutating session.roster[idx] in place - this used to write straight
+  // into the in-memory session object, which reflects instantly in the UI
+  // (same object reference) but is invisible to sessions.json until some
+  // later, unrelated change happens to call update() too. A crash between
+  // clicking Remove and that next action would silently un-remove the
+  // player on restart.
+  if (action === 'keep' || action === 'discard') {
+    const roster = [...session.roster];
+    roster[idx] = { ...roster[idx], status: action };
+    sessions.update(interaction.channel.id, { roster });
+    const verb = action === 'keep' ? 'Kept' : 'Removed';
+    await interaction.update({ content: `${verb} **${roster[idx].displayName || roster[idx].statlockerUsername}**.`, components: [] });
     await renderControlPanel(interaction.channel);
     return;
   }

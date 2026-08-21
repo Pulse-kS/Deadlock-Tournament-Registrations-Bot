@@ -198,6 +198,15 @@ module.exports = {
     maxMain: parseInt(process.env.ROSTER_MAX_MAIN || '6', 10),
     maxSubs: parseInt(process.env.ROSTER_MAX_SUBS || '2', 10),
   },
+  registration: {
+    // Whether promptNewOrJoin (registrationFlow.js) offers the "I am a
+    // Free Agent" button at all. Only gates that one entry point - it
+    // doesn't touch FreeAgents-tab reads/writes or anything already
+    // signed up, so flipping this off mid-event doesn't affect existing
+    // free agents. Defaults on; set FREE_AGENT_SIGNUP_ENABLED=false to
+    // hide the button for an event that isn't taking free agents.
+    freeAgentEnabled: process.env.FREE_AGENT_SIGNUP_ENABLED !== 'false',
+  },
   // How often to sweep for and archive stale (inactive) registration
   // sessions - see sessions.purgeStale/index.js. Previously this only ran
   // once at startup, so a long-running bot never expired an abandoned

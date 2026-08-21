@@ -53,18 +53,36 @@ extract_json_field() {
 
 CHANNEL_ID=$(extract_json_field channelId "$REQUEST_FILE")
 FROM_VERSION=$(extract_json_field fromVersion "$REQUEST_FILE")
+FROM_HASH=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 
-echo "[update-watcher] Update requested for channel ${CHANNEL_ID:-unknown} (from ${FROM_VERSION:-unknown}) - pulling..."
+echo "[update-watcher] Update requested for channel ${CHANNEL_ID:-unknown} (from ${FROM_VERSION:-unknown} @ ${FROM_HASH}) - pulling..."
 
 export GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes"
 if ! git pull --ff-only; then
   echo "[update-watcher] git pull failed - leaving request in place for manual review."
-  mv "$REQUEST_FILE" "$FAILED_FILE"
   echo "{\"error\": \"git pull failed\", \"channelId\": \"$CHANNEL_ID\"}" > "$FAILED_FILE"
+  mv "$REQUEST_FILE" "$FAILED_FILE" 2>/dev/null || rm -f "$REQUEST_FILE"
   exit 1
 fi
 
+TO_HASH=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 TO_VERSION=$(extract_json_field version package.json)
+
+# index.js's announceUpdateIfPending() branches on ack.upToDate - if the
+# pull didn't move HEAD, there's nothing new to run, so skip the
+# rebuild/restart entirely rather than paying for a docker rebuild (and a
+# few seconds of downtime) for a no-op. This is also the only case that
+# doesn't restart the process, which is why it's the one index.js has to
+# poll for on a timer instead of only checking once at boot.
+if [ "$FROM_HASH" = "$TO_HASH" ]; then
+  echo "[update-watcher] Already up to date (${TO_HASH}) - nothing to rebuild."
+  rm -f "$REQUEST_FILE"
+  if [ -n "$CHANNEL_ID" ]; then
+    printf '{"channelId": "%s", "upToDate": true, "fromVersion": "%s", "fromHash": "%s", "toHash": "%s"}\n' \
+      "$CHANNEL_ID" "$FROM_VERSION" "$FROM_HASH" "$TO_HASH" > "$ACK_FILE"
+  fi
+  exit 0
+fi
 
 echo "[update-watcher] Rebuilding and restarting..."
 if ! docker compose down || ! docker compose up -d --build; then
@@ -76,7 +94,8 @@ fi
 
 rm -f "$REQUEST_FILE"
 if [ -n "$CHANNEL_ID" ]; then
-  printf '{"channelId": "%s", "fromVersion": "%s", "toVersion": "%s"}\n' "$CHANNEL_ID" "$FROM_VERSION" "$TO_VERSION" > "$ACK_FILE"
+  printf '{"channelId": "%s", "upToDate": false, "fromVersion": "%s", "fromHash": "%s", "toHash": "%s"}\n' \
+    "$CHANNEL_ID" "$FROM_VERSION" "$FROM_HASH" "$TO_HASH" > "$ACK_FILE"
 fi
 
-echo "[update-watcher] Done: ${FROM_VERSION:-unknown} -> ${TO_VERSION:-unknown}"
+echo "[update-watcher] Done: ${FROM_VERSION:-unknown} @ ${FROM_HASH} -> ${TO_VERSION:-unknown} @ ${TO_HASH}"

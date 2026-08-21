@@ -1,5 +1,5 @@
 const config = require('../config');
-const { callAppsScript: callAppsScriptShared } = require('../utils/appsScriptClient');
+const appsScriptClient = require('../utils/appsScriptClient');
 
 /**
  * Local-first Sheets access.
@@ -33,6 +33,10 @@ const { callAppsScript: callAppsScriptShared } = require('../utils/appsScriptCli
 
 let store = null; // Map<tabName, { headers: string[], rows: object[] }>
 let dirty = false;
+// Bumped on every local write (appendRow/updateRow). Lets flush() tell
+// whether a write landed while its network request was in flight - see
+// doFlushOnce() below for why that matters.
+let storeGeneration = 0;
 let syncTimer = null;
 let initialized = false;
 
@@ -59,7 +63,7 @@ const READ_ONLY_TABS = new Set([config.sheets.tabs.playerDB, config.sheets.tabs.
 // that got folded into this same spreadsheet - see PlayerDB/TeamDB in
 // apps-script/Code.gs).
 async function callAppsScript(action, payload = {}) {
-  return callAppsScriptShared(config.sheets.webAppUrl, config.sheets.sharedSecret, action, payload, '[sheets]');
+  return appsScriptClient.callAppsScript(config.sheets.webAppUrl, config.sheets.sharedSecret, action, payload, '[sheets]');
 }
 
 function rowFromValues(headers, values, rowNumber) {
@@ -104,15 +108,39 @@ async function init() {
   initialized = true;
 }
 
+let flushChain = Promise.resolve({ skipped: true });
+
 /**
  * Pushes the local store's current state up to the real Google Sheet,
  * replacing each tab's data rows wholesale. No-ops if nothing has changed
  * since the last flush.
+ *
+ * Callers (background sync timer, /refresh, and flushSoon() after every
+ * registration commit) are NOT mutually exclusive with each other and can
+ * fire close together, so this serializes them onto one chain rather than
+ * letting two replaceAllTables() network calls run in parallel - with two
+ * in flight at once, whichever happened to *start* with the older snapshot
+ * could still *finish* second and silently overwrite the newer one that
+ * "won" the race by responding first.
  */
-async function flush() {
+function flush() {
   assertInitialized();
+  // Chaining onto the previous call (rather than only running when idle)
+  // also fixes a second, subtler race: a write landing in the local store
+  // while a flush's network request is already in flight would otherwise
+  // get folded into "nothing new happened" once that flush resolves (its
+  // snapshot was taken before the write, but a naive `dirty = false` after
+  // doesn't know that) - see doFlushOnce()'s generation check for the other
+  // half of that fix. `.catch(() => {})` keeps one failed flush from
+  // permanently blocking every flush queued after it.
+  flushChain = flushChain.catch(() => {}).then(() => doFlushOnce());
+  return flushChain;
+}
+
+async function doFlushOnce() {
   if (!dirty) return { skipped: true };
 
+  const generationAtStart = storeGeneration;
   const tables = {};
   for (const [tabName, table] of store.entries()) {
     if (READ_ONLY_TABS.has(tabName)) continue; // never push PlayerDB/TeamDB - staff own that data
@@ -126,7 +154,16 @@ async function flush() {
   }
 
   await callAppsScript('replaceAllTables', { tables });
-  dirty = false;
+
+  // Only clear dirty if nothing wrote to the local store while that request
+  // was in flight - a write that landed mid-flight wasn't in the snapshot
+  // above, so it still needs a flush of its own. Leaving dirty alone here
+  // means the *next* flush() call (chained right after this one resolves,
+  // or the next scheduled/manual one) will pick it up instead of it being
+  // silently dropped. This also protects refreshAllTables() below, which
+  // trusts !dirty to mean "the local store has nothing unpushed and is
+  // safe to wholesale-replace."
+  if (storeGeneration === generationAtStart) dirty = false;
   return { skipped: false };
 }
 
@@ -154,7 +191,23 @@ async function refreshAllTables() {
     console.error('[sheets] refreshAllTables() called with unflushed local writes pending - skipping to avoid losing them.');
     return false;
   }
+  const generationAtStart = storeGeneration;
   const { tables } = await callAppsScript('getAllTables');
+
+  // Same generation check as doFlushOnce() above, and for the same reason:
+  // the dirty check up top only proves nothing was pending *before* this
+  // network call started - a write landing during it (e.g. a registration
+  // committing while a scheduled refresh is mid-flight) wouldn't be caught
+  // by that check, and `store = next` below would otherwise silently
+  // discard it. If that happened, bail without touching `store` - dirty is
+  // already true again from that write, so the next flush()+refresh cycle
+  // (chained onto flushChain, so it can't overlap this one) will pick it up
+  // correctly instead.
+  if (storeGeneration !== generationAtStart) {
+    console.error('[sheets] refreshAllTables() detected a write during its own fetch - discarding this refresh to avoid losing it. Will retry next sync.');
+    return false;
+  }
+
   const next = new Map();
   for (const [tabName, { headers, values }] of Object.entries(tables)) {
     const rows = values
@@ -226,6 +279,7 @@ async function appendRow(tabName, rowObject) {
   const row = rowFromValues(table.headers, table.headers.map((h) => (rowObject[h] !== undefined ? rowObject[h] : '')), nextRowNumber);
   table.rows.push(row);
   dirty = true;
+  storeGeneration += 1;
 }
 
 /**
@@ -253,6 +307,7 @@ async function updateRow(tabName, rowNumber, rowObject) {
     existing[h] = merged[h] !== undefined ? merged[h] : '';
   });
   dirty = true;
+  storeGeneration += 1;
 }
 
 /** Returns the entire local store (all tabs) - local-only, no network call. Used by services/localSnapshot.js. */

@@ -77,6 +77,15 @@ function create(threadId, initial) {
     // promptTeamLogo/handleMessage.
     awaitingLogo: false,
     createdAt: Date.now(),
+    // Distinct from createdAt: bumped on every update() call (i.e. any
+    // captain action - adding/editing a slot, uploading a logo, etc), so
+    // purgeStale below actually measures time since the captain last did
+    // something, not time since the thread was first opened. Without this,
+    // a captain who's been genuinely active the whole time but started
+    // more than maxAgeMs ago would still get purged out from under them
+    // mid-conversation - the opposite of what the "expired after 48h of
+    // inactivity" message they're shown actually claims.
+    lastActivityAt: Date.now(),
   };
   sessions.set(threadId, session);
   persist();
@@ -105,7 +114,7 @@ function findByOwner(ownerId) {
 function update(threadId, patch) {
   const session = sessions.get(threadId);
   if (!session) return undefined;
-  Object.assign(session, patch);
+  Object.assign(session, patch, { lastActivityAt: Date.now() });
   persist();
   return session;
 }
@@ -124,7 +133,10 @@ function purgeStale(maxAgeMs = 48 * 60 * 60 * 1000) {
   const now = Date.now();
   const purged = [];
   for (const [threadId, session] of sessions.entries()) {
-    if (now - session.createdAt > maxAgeMs) {
+    // Fall back to createdAt for a session persisted before lastActivityAt
+    // existed (old sessions.json from a previous bot version).
+    const lastActivity = session.lastActivityAt || session.createdAt;
+    if (now - lastActivity > maxAgeMs) {
       purged.push(threadId);
       sessions.delete(threadId);
     }

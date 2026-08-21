@@ -9,7 +9,7 @@ roles + a Google Sheet backend automatically.
 running bot. This document covers the same ground in more depth, plus
 Docker, remote updates, and everything else.
 
-## Status: 20260819-05
+## Status: 20260821-03
 
 Core registration flow (new team, edit existing team, keep/rename/discard
 per slot, Steam ID resolution, statlocker lookup, nationality capture, role
@@ -358,6 +358,18 @@ completed registration commit, on a timer as a backstop
 shutdown (`Ctrl+C` / `SIGTERM`) so a deliberate restart doesn't lose
 anything.
 
+`flush()` calls themselves are serialized against each other - the
+background sync timer, `/refresh`, and the post-commit push that follows
+every registration all call `sheets.flush()` without waiting for each
+other, so `flush()` chains every call onto one internal queue rather than
+letting two `replaceAllTables` pushes run in parallel. That's specifically
+so an older snapshot can never land *after*, and silently clobber, a newer
+one, and so a write that lands while a push is already in flight gets its
+own follow-up push instead of being folded into "nothing changed" once
+that in-flight push resolves. See `flush()`/`doFlushOnce()` in `sheets.js`
+(a generation counter on top of the queue does the second half of that)
+and `test/sheets.test.js` for the regression tests.
+
 This trades strict consistency for speed, on two assumptions specific to
 this setup - re-check both before reusing this pattern elsewhere:
 
@@ -372,20 +384,24 @@ this setup - re-check both before reusing this pattern elsewhere:
   the next sync, and a missing/renamed column makes that sync fail
   outright (loud error, not silent) until the header's restored or
   `setupSheet()` is re-run.
-- **The bot's own crashes/restarts are an acceptable risk.** Writes only
-  exist in that process's memory until the next sync (or clean shutdown)
-  pushes them up. If the bot crashes, or is killed ungracefully (`kill -9`,
-  a host losing power), whatever happened since the last successful sync
-  is gone from the Sheet's perspective - not logged anywhere, not
-  recoverable. This was an explicit, accepted trade-off for a
-  single-operator setup on a machine that's reliably kept running - it's
-  not a "ping staff and move on" situation like other failure modes in this
-  bot, it's silent data loss with no error at all. If that stops being an
-  acceptable risk (e.g. hosting moves to something less reliable, or more
-  people start relying on this), the fix is either a shorter sync interval
-  (cheap, doesn't eliminate the window) or reverting to the older
-  per-operation network writes this replaced (see git history / earlier
-  versions of `sheets.js`).
+- **A crash between syncs can still lose non-commit writes.** Every
+  *completed registration commit* is durable now (see "Crash safety"
+  above) - it's queued to `pending-writes.json` before the write even
+  starts, survives a full process crash, and replays automatically on the
+  next startup. What's **not** covered by that queue is any other local
+  write this store makes outside a commit - specifically, the
+  `PlayerRegistry` name/identity update that happens each time a captain
+  adds or edits a player while still building their roster, before they've
+  clicked Finish (see `registry.upsertPlayer` in `registrationFlow.js`).
+  Those writes only exist in this process's memory until the next sync (or
+  clean shutdown) pushes them up - a crash before that sync loses them from
+  the Sheet's perspective, silently, with nothing queued to replay. This
+  was an accepted trade-off for a single-operator setup on a machine that's
+  reliably kept running, and the actual data at risk is narrow (a
+  statlocker-name/nationality touch-up gets silently skipped rather than a
+  whole registration) - but it's real. If that stops being an acceptable
+  risk, the fix is extending the same commit-intent pattern to cover these
+  writes too, or a shorter sync interval (cheap, only narrows the window).
 
 Worth knowing: `pendingWrites.js` (the retry queue for background Sheets
 writes after a captain's registration is confirmed - see "Performance"
@@ -466,7 +482,10 @@ they only want to be available as an emergency substitute. Keyed by
 `account_id` same as everywhere else - re-registering as a free agent updates
 the existing row rather than adding a duplicate. Player identity itself
 (name/nationality/Discord link) is still also written to `PlayerRegistry` as
-usual, same as a rostered player.
+usual, same as a rostered player. The "I am a Free Agent" button itself can
+be hidden entirely (e.g. for an event that isn't taking free agents) by
+setting `FREE_AGENT_SIGNUP_ENABLED=false` - existing free agents and their
+data are untouched, this only stops new sign-ups.
 
 #### Migrating a finished event
 
