@@ -1,6 +1,6 @@
 {
   "name": "tournament-registration-bot",
-  "version": "20260821-03",
+  "version": "20260822-01",
   "description": "Discord bot for team-based tournament signup, roster management, and Google Sheets sync via Apps Script.",
   "main": "src/index.js",
   "type": "commonjs",

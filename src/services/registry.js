@@ -46,17 +46,29 @@ async function upsertPlayer({ accountId, statlockerUsername, discordId, national
   const existing = await getPlayerByAccountId(accountId);
 
   if (!existing) {
+    // Falls back to statlockerUsername rather than ever writing a blank
+    // display_name for a brand-new player - a caller forgetting to resolve
+    // one (see the 20260821 fix in registrationFlow.js's handleKeepName,
+    // which is what actually produced the blank rows this guards against)
+    // shouldn't be able to leave this column empty.
     const newRow = {
       account_id: accountId,
       statlocker_username: statlockerUsername,
       discord_id: discordId || '',
       historical_names: statlockerUsername,
       nationality: nationality || '',
-      display_name: displayName || '',
+      display_name: displayName || statlockerUsername || '',
     };
     await sheets.appendRow(TAB, newRow);
     return { player: newRow, flagged: false };
   }
+
+  // For an EXISTING player, only fall back to statlockerUsername if
+  // there's truly nothing else on file - a caller that doesn't pass
+  // displayName (e.g. the early ID-lookup step, which runs before the
+  // captain has chosen a name) must not clobber a real on-file name with
+  // the raw Steam username on every subsequent registration.
+  const resolvedDisplayName = displayName || existing.display_name || statlockerUsername || '';
 
   const onFileName = existing.statlocker_username;
   if (onFileName && statlockerUsername && onFileName !== statlockerUsername) {
@@ -73,7 +85,7 @@ async function upsertPlayer({ accountId, statlockerUsername, discordId, national
     // it's safe to update directly rather than flagging.
     await sheets.updateRow(TAB, existing._rowNumber, {
       nationality: nationality || existing.nationality,
-      display_name: displayName || existing.display_name,
+      display_name: resolvedDisplayName,
     });
     return { player: existing, flagged: true };
   }
@@ -82,7 +94,7 @@ async function upsertPlayer({ accountId, statlockerUsername, discordId, national
   await sheets.updateRow(TAB, existing._rowNumber, {
     discord_id: discordId || existing.discord_id,
     nationality: nationality || existing.nationality,
-    display_name: displayName || existing.display_name,
+    display_name: resolvedDisplayName,
   });
   return { player: existing, flagged: false };
 }

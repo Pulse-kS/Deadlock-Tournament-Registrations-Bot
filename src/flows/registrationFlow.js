@@ -1496,7 +1496,11 @@ async function handleSlotTypeSelect(interaction, session) {
   });
 }
 
+/** "Use Steam name" - explicitly sets displayName to the statlocker username, rather than leaving it unset (which produced a blank display_name in PlayerRegistry - see the bug this fixed). */
 async function handleKeepName(interaction, session) {
+  sessions.update(interaction.channel.id, {
+    pendingSlot: { ...session.pendingSlot, displayName: session.pendingSlot.statlockerUsername },
+  });
   await goToNationalityStep(interaction, session);
 }
 
@@ -1783,7 +1787,10 @@ function applyPendingSlotLinkage(thread, { discordId }) {
     accountId: pending.accountId,
     slotType: pending.slotType,
     statlockerUsername: pending.statlockerUsername,
-    displayName: pending.displayName || '',
+    // Falls back to the statlocker username rather than risking a blank
+    // display_name in PlayerRegistry (see handleKeepName's fix) - this is
+    // a second, defense-in-depth fallback, not the primary fix.
+    displayName: pending.displayName || pending.statlockerUsername || '',
     nationality: pending.nationality || '',
     discordId,
     status: replaceIdx != null ? 'renamed' : 'new',

@@ -9,7 +9,7 @@ roles + a Google Sheet backend automatically.
 running bot. This document covers the same ground in more depth, plus
 Docker, remote updates, and everything else.
 
-## Status: 20260821-03
+## Status: 20260822-01
 
 Core registration flow (new team, edit existing team, keep/rename/discard
 per slot, Steam ID resolution, statlocker lookup, nationality capture, role
