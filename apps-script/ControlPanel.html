@@ -35,11 +35,11 @@
             Returns a summary string, or throws on failure.
 
        clearCurrentSignups()
-         -> clears Teams' current signup rows (NOT PlayerRegistry - that
-            table is persistent player identity, not per-event data; see
-            its doc comment in Code.gs). Returns a summary string, or
-            throws on failure. Destructive - the panel already
-            double-confirms client-side before calling it.
+         -> clears Teams' AND PlayerRegistry's current data rows (run
+            updateDatabase() first - see its doc comment in Code.gs).
+            Returns a summary string, or throws on failure. Destructive -
+            the panel already double-confirms client-side before calling
+            it.
 
      Any of the five can throw a plain Error(message) - the message shows
      up verbatim in the panel's status area.

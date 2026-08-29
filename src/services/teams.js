@@ -278,6 +278,37 @@ async function applyFreeAgentRole(guild, discordId) {
 }
 
 /**
+ * Shared revoke-only helper, the mirror of grantRole above: removes roleId
+ * from every given Discord user, no-op per-member if they're not in the
+ * guild, don't have the role, or roleId itself is unset/unresolvable. Same
+ * failure shape as grantRole/reconcileTeamRole.
+ */
+async function revokeRole(guild, roleId, discordIds, reason) {
+  if (!roleId) return [];
+  const role = await guild.roles.fetch(roleId).catch(() => null);
+  if (!role) return [];
+
+  const failures = [];
+  for (const id of new Set(discordIds.filter(Boolean))) {
+    const member = await guild.members.fetch(id).catch(() => null);
+    if (!member || !member.roles.cache.has(roleId)) continue;
+    await member.roles.remove(role, reason).catch((error) => {
+      failures.push({ discordId: id, action: 'remove', error });
+    });
+  }
+  return failures;
+}
+
+/**
+ * Strips config.discord.freeAgentRoleId from a player who's just been
+ * committed onto a team roster (see registrationFlow.js's performCommit) -
+ * the removal-side mirror of applyFreeAgentRole above.
+ */
+async function removeFreeAgentRole(guild, discordId) {
+  return revokeRole(guild, config.discord.freeAgentRoleId, [discordId], 'Joined a team roster - no longer a free agent');
+}
+
+/**
  * Called from guildMemberAdd. Looks up the new joiner's PlayerRegistry row
  * by discord_id to get their account_id, then checks every Teams row's
  * roster columns for that account_id (live, not a queued snapshot) - if
@@ -314,6 +345,7 @@ module.exports = {
   syncTeamRoleName,
   applyParticipantRole,
   applyFreeAgentRole,
+  removeFreeAgentRole,
   applyRoleOnJoin,
   rosterFromTeamRow,
   buildRosterColumns,

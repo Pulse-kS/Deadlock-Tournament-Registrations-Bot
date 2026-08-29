@@ -332,6 +332,23 @@ async function findRows(tabName, predicate) {
   return rows.filter(predicate);
 }
 
+/**
+ * Removes a single row (by 1-indexed sheet row number, as returned in
+ * _rowNumber from getTable) from a tab. No-op if no row with that number
+ * exists - matches updateRow's lenient-rather-than-throwing style above.
+ */
+async function deleteRow(tabName, rowNumber) {
+  assertInitialized();
+  const table = store.get(tabName);
+  if (!table) throw new Error(`Unknown tab: ${tabName}`);
+
+  const idx = table.rows.findIndex((r) => r._rowNumber === rowNumber);
+  if (idx === -1) return;
+  table.rows.splice(idx, 1);
+  dirty = true;
+  storeGeneration += 1;
+}
+
 module.exports = {
   init,
   flush,
@@ -344,4 +361,5 @@ module.exports = {
   updateRow,
   findRow,
   findRows,
+  deleteRow,
 };

@@ -19,6 +19,7 @@ const localSnapshot = require('../services/localSnapshot');
 const sheets = require('../services/sheets');
 const teams = require('../services/teams');
 const registry = require('../services/registry');
+const freeAgents = require('../services/freeAgents');
 const playerDB = require('../services/playerDB');
 const teamDB = require('../services/teamDB');
 const steamService = require('../services/steam');
@@ -1286,6 +1287,26 @@ async function handleModalSubmit(interaction) {
       return;
     }
 
+    // Free agent -> team check: unlike the Teams conflict above, this
+    // never blocks - it's just a heads-up that this player is currently
+    // signed up as a free agent and is about to be moved onto a roster
+    // instead. Posted non-ephemerally (thread.send, not editReply) so it's
+    // visible to more than just the captain who triggered it.
+    // Deliberately does NOT touch the FreeAgents sheet row or the Discord
+    // free-agent role here - nothing in this add-slot step is final yet
+    // (session.roster is still just an in-progress editor state; see
+    // performCommit for the only point a registration is actually
+    // committed). The flag set on pendingSlot below carries this through
+    // to performCommit, which is where the row removal and role strip
+    // actually happen, same as every other Discord/Sheets side effect in
+    // this flow.
+    const freeAgentRow = await freeAgents.findByAccountId(accountId);
+    if (freeAgentRow) {
+      await thread.send(
+        `**${lookup.username}** was signed up as a free agent - removing the free agent role and adding them to this roster.`
+      );
+    }
+
     // A player's own PlayerRegistry row is only ever pulled here after the
     // cross-team check above already confirmed this account isn't on any
     // live roster - so if a row already exists, it's someone who's played
@@ -1331,6 +1352,7 @@ async function handleModalSubmit(interaction) {
       pendingSlot: {
         replaceIndex: priorPending.replaceIndex,
         accountId,
+        wasFreeAgent: !!freeAgentRow,
         // Deliberately lookup.username (the live statlocker report), not
         // player.statlocker_username - when flagged, that's the old on-file
         // name kept authoritative for anti-impersonation purposes (see
@@ -1794,6 +1816,11 @@ function applyPendingSlotLinkage(thread, { discordId }) {
     nationality: pending.nationality || '',
     discordId,
     status: replaceIdx != null ? 'renamed' : 'new',
+    // Carried through from the add-slot free-agent check (see
+    // handleAccountIdSubmit) - performCommit reads this to know which
+    // roster slots need their FreeAgents row removed and free-agent role
+    // stripped once the registration actually commits.
+    wasFreeAgent: !!pending.wasFreeAgent,
   };
 
   if (replaceIdx != null) {
@@ -2244,6 +2271,46 @@ async function performCommit(guild, thread, session, teamRoleId, actorTag, actor
       `Some participant role grants for **${session.teamName}** didn't go through:\n${lines.join('\n')}`,
       participantFailures.map((f) => f.discordId)
     ).catch(() => {});
+  }
+
+  // Free-agent -> roster handoff: for every slot flagged wasFreeAgent (set
+  // in handleAccountIdSubmit, once the captain actually added them to this
+  // roster - see that function's doc comment), this is the point it
+  // actually becomes real: strip the free-agent role and remove their
+  // FreeAgents row, now that they're committed to a team for good. Done
+  // per-slot rather than batched like reconcileTeamRole above since each
+  // one is two independent operations (Discord role, Sheets row) that can
+  // each fail on their own - a Sheets failure here doesn't get retried by
+  // pendingWrites the way the main roster write below does, so any failure
+  // is surfaced to staff immediately rather than silently dropped.
+  const freeAgentGraduates = activeRoster.filter((r) => r.wasFreeAgent);
+  for (const r of freeAgentGraduates) {
+    const roleFailure = r.discordId ? await teams.removeFreeAgentRole(guild, r.discordId) : [];
+    if (roleFailure.length) {
+      await pingStaff(
+        thread,
+        `Could not remove the free-agent role for **${r.displayName || r.statlockerUsername}** (<@${r.discordId}>) - please remove it manually.`,
+        [r.discordId]
+      ).catch(() => {});
+    }
+    const removed = await freeAgents.remove(r.accountId).catch((error) => {
+      pingStaff(
+        thread,
+        `**${r.displayName || r.statlockerUsername}** was a free agent but their FreeAgents row could not be removed (${error.message || error}) - please remove it manually.`
+      ).catch(() => {});
+      return true; // Suppress the "already gone" ping below - this was a real error, not a no-op.
+    });
+    if (!removed) {
+      // No FreeAgents row found to remove - shouldn't normally happen given
+      // wasFreeAgent was only set after a successful lookup, but the row
+      // could've been removed independently in the meantime (e.g. staff
+      // manually editing the sheet), so this is surfaced rather than
+      // silently ignored.
+      await pingStaff(
+        thread,
+        `**${r.displayName || r.statlockerUsername}** was flagged as a former free agent, but no matching FreeAgents row was found to remove.`
+      ).catch(() => {});
+    }
   }
 
   if (missingDiscordLink.length) {

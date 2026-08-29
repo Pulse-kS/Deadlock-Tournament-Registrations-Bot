@@ -446,9 +446,11 @@ ISO alpha-2 code (e.g. `AU`) for the Liquipedia-style roster export.
 and only overrides what's *shown* on rosters (e.g. for inappropriate
 statlocker names) - `statlocker_username` is left untouched underneath so
 rename detection keeps working correctly. This is pure player identity -
-**no team/roster fields live here** (see `Teams` below for that) - so
-there's nothing to reset between events; a player's row just persists as-is
-run to run.
+**no team/roster fields live here** (see `Teams` below for that). This is
+only meant to hold state for the currently-running event; once it wraps,
+rows get migrated to `PlayerDB` by staff and this tab starts fresh for the
+next event (see "Migrating a finished event" below) - same lifecycle as
+`Teams`.
 
 **Teams**
 | team_role_id | team_name | logo_url | vc_channel_id | p1 | p2 | p3 | p4 | p5 | p6 | s1 | s2 | c1 | c2 |
@@ -485,7 +487,10 @@ the existing row rather than adding a duplicate. Player identity itself
 usual, same as a rostered player. The "I am a Free Agent" button itself can
 be hidden entirely (e.g. for an event that isn't taking free agents) by
 setting `FREE_AGENT_SIGNUP_ENABLED=false` - existing free agents and their
-data are untouched, this only stops new sign-ups.
+data are untouched, this only stops new sign-ups. Same lifecycle as `Teams`
+and `PlayerRegistry`: this only holds the currently-running event's free
+agents, and rows get migrated to `PlayerDB` by staff once the event wraps
+(see "Migrating a finished event" below).
 
 #### Migrating a finished event
 
@@ -521,10 +526,14 @@ script reading columns straight off `Teams`, same as you've done against
    The two steps are deliberately independent - if the Sheets migration
    fails, the log still gets archived (with a clear note in the output),
    rather than one failure blocking the other.
-3. Clear `Teams`' data rows (below the header) for the next event - still a
-   manual step; nothing here deletes real signup data. Leave
-   `PlayerRegistry` alone unless you're also doing the `PlayerRegistry` →
-   `PlayerDB` cleanup, which step 2 already did.
+3. Clear `Teams`' and `PlayerRegistry`'s data rows (below the header) for
+   the next event - still a manual step; nothing here deletes real signup
+   data on its own. Only run this after step 2, since step 2 is what
+   archives both tables into `TeamDB`/`PlayerDB` first - clearing before
+   that would lose data with no undo. **Known gap:** clearing
+   `PlayerRegistry` currently breaks returning-player detection on
+   Discord rejoin (see `findPlayerByDiscordId` in `src/services/
+   registry.js`) - that lookup hasn't been repointed at `PlayerDB` yet.
 
 Restart the bot after (step 2's Sheets migration doesn't need its own
 redeploy beyond the one-time `Code.gs` update above, but the bot's

@@ -1331,36 +1331,60 @@ function migrateFinishedEvent() {
 }
 
 /**
- * Clears this event's signup rows from `Teams` (data rows only - header
- * row 1 is left alone), so the sheet is ready for the next event's
- * registrations. This is the "still a manual step" Teams cleanup
- * migrateFinishedEvent() above deliberately doesn't do on its own - run
- * this only after rosters have been sent and the database updated, since
- * there's no undo once these rows are gone.
+ * Clears this event's signup rows from `Teams` AND `PlayerRegistry` (data
+ * rows only - header row 1 is left alone in each), so both sheets are
+ * ready for the next event's registrations. This is the "still a manual
+ * step" cleanup migrateFinishedEvent() above deliberately doesn't do on
+ * its own - run this only after rosters have been sent and the database
+ * updated, since there's no undo once these rows are gone.
  *
- * Deliberately does NOT touch PlayerRegistry: unlike Teams (which holds
- * only the CURRENT event's roster membership), PlayerRegistry is a
- * persistent player-identity table the bot looks players up in across
- * events (e.g. on rejoining Discord - see registry.js's
- * findPlayerByDiscordId) - clearing it would break returning-player
- * detection for every future event, not just reset this one.
+ * PlayerRegistry is included here (as of 20260829) on the same footing as
+ * Teams: migrateFinishedEvent() already copies both into TeamDB/PlayerDB,
+ * so by the time this runs, PlayerRegistry's rows are archived and safe to
+ * clear - it's per-event working data, not a database of record.
+ *
+ * KNOWN FOLLOW-UP NOT YET DONE: registry.js's findPlayerByDiscordId still
+ * reads PlayerRegistry to recognize a returning player on guildMemberAdd.
+ * Once PlayerRegistry is actually being cleared each event, that lookup
+ * will stop finding anyone from a prior event and needs to be repointed at
+ * PlayerDB instead - tracked separately, not fixed by this change.
  */
 function clearCurrentSignups() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const teamsSheet = ss.getSheetByName('Teams');
   if (!teamsSheet) throw new Error('Teams tab not found.');
-  const lastRow = teamsSheet.getLastRow();
-  if (lastRow < 2) {
-    return 'Teams already had no signup rows to clear.';
+  const registrySheet = ss.getSheetByName('PlayerRegistry');
+  if (!registrySheet) throw new Error('PlayerRegistry tab not found.');
+
+  const messages = [];
+
+  const teamsLastRow = teamsSheet.getLastRow();
+  if (teamsLastRow < 2) {
+    messages.push('Teams already had no signup rows to clear.');
+  } else {
+    // Only clear the bot-managed columns (SCHEMA.Teams - team_role_id
+    // through c2). Deliberately NOT sheet.getLastColumn(): staff often add
+    // their own columns to the right (e.g. a
+    // =STATLOCKER_AVERAGE_PPSCORE(...) formula for seeding) - those are
+    // outside the bot's schema and clearing to getLastColumn() was wiping
+    // them out along with the actual signup data.
+    const teamsLastCol = SCHEMA.Teams.length;
+    teamsSheet.getRange(2, 1, teamsLastRow - 1, teamsLastCol).clearContent();
+    messages.push(`Cleared ${teamsLastRow - 1} signup row(s) from Teams.`);
   }
-  // Only clear the bot-managed columns (SCHEMA.Teams - team_role_id through
-  // c2). Deliberately NOT sheet.getLastColumn(): staff often add their own
-  // columns to the right (e.g. a =STATLOCKER_AVERAGE_PPSCORE(...) formula
-  // for seeding) - those are outside the bot's schema and clearing to
-  // getLastColumn() was wiping them out along with the actual signup data.
-  const lastCol = SCHEMA.Teams.length;
-  teamsSheet.getRange(2, 1, lastRow - 1, lastCol).clearContent();
-  return `Cleared ${lastRow - 1} signup row(s) from Teams.`;
+
+  const registryLastRow = registrySheet.getLastRow();
+  if (registryLastRow < 2) {
+    messages.push('PlayerRegistry already had no rows to clear.');
+  } else {
+    // Same bot-managed-columns-only guard as Teams above, in case staff
+    // have added their own columns to the right of PlayerRegistry too.
+    const registryLastCol = SCHEMA.PlayerRegistry.length;
+    registrySheet.getRange(2, 1, registryLastRow - 1, registryLastCol).clearContent();
+    messages.push(`Cleared ${registryLastRow - 1} row(s) from PlayerRegistry.`);
+  }
+
+  return messages.join(' ');
 }
 
 /**
